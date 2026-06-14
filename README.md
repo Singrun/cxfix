@@ -33,6 +33,22 @@ GitHub or any remote service.
 
 ## Install
 
+### Download a release
+
+Download `cxfix-v1.0.0.zip` or `cxfix-v1.0.0.tar.gz` from the
+[GitHub Releases page](https://github.com/Singrun/cxfix/releases), extract it,
+then run:
+
+```bash
+python3 install.py
+source ~/.zshrc
+```
+
+The release also provides a standalone `cxfix` executable for users who prefer
+to install the script manually.
+
+### Clone the repository
+
 ```bash
 git clone https://github.com/Singrun/cxfix.git
 cd cxfix
@@ -42,6 +58,34 @@ source ~/.zshrc
 
 The installer adds `~/.local/bin` to `PATH`, sets the standard SQLite home, and
 creates the `cxfix` alias.
+
+## Recommended zsh Configuration
+
+The installer manages this block in `~/.zshrc`:
+
+```zsh
+# >>> codex session history repair >>>
+export PATH="$HOME/.local/bin:$PATH"
+export CODEX_SQLITE_HOME="$HOME/.codex/sqlite"
+alias cxfix="codex-history-repair"
+# <<< codex session history repair <<<
+```
+
+Useful optional shortcuts:
+
+```zsh
+# Repair the official/current database.
+alias cxfix-now='cxfix -y'
+
+# Synchronize every discovered Codex database.
+alias cxfix-all='cxfix all -y'
+
+# Preserve third-party provider labels.
+alias cxfix-keep='cxfix all -y --preserve-providers'
+```
+
+Do not run these aliases while Codex Desktop is open. The utility will refuse
+to continue if it detects an active Codex process.
 
 ## Usage
 
