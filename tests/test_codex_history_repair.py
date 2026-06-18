@@ -40,6 +40,25 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.scope, "plugins")
         self.assertTrue(args.dry_run)
 
+    def test_short_plugins_scope_and_dry_run_are_accepted(self):
+        with mock.patch("sys.argv", ["cxfix", "p", "-n"]):
+            args = repair.parse_args()
+
+        self.assertEqual(args.scope, "p")
+        self.assertTrue(args.dry_run)
+
+    def test_short_plugin_cache_options_are_accepted(self):
+        with mock.patch(
+            "sys.argv",
+            ["cxfix", "plugin-cache", "-s", "openai-primary-runtime", "-A", "-v", "-S"],
+        ):
+            args = repair.parse_args()
+
+        self.assertEqual(args.source, ["openai-primary-runtime"])
+        self.assertTrue(args.apply)
+        self.assertTrue(args.visible_mounts)
+        self.assertTrue(args.skip_symlinks)
+
 
 class DiscoverStateDatabasesTests(unittest.TestCase):
     def test_finds_real_codex_databases_and_excludes_backups(self):

@@ -120,26 +120,33 @@ cxfix all -y --prepare-only
 Mount all cached plugin skills visibly into Codex:
 
 ```bash
-cxfix plugins
+cxfix p
 ```
 
 Preview what would be mounted without writing:
 
 ```bash
+cxfix p -n
+```
+
+Long aliases are still available:
+
+```bash
+cxfix plugins
 cxfix plugins --dry-run
 ```
 
 Advanced: create missing top-level symlinks under `~/.codex/skills`:
 
 ```bash
-cxfix plugin-cache --apply
+cxfix plugin-cache -A
 ```
 
 Advanced: only expose one cached plugin source, such as the primary runtime
 Office-style skills:
 
 ```bash
-cxfix plugin-cache --source openai-primary-runtime --apply
+cxfix plugin-cache -s openai-primary-runtime -A
 ```
 
 The generated visible names use this shape:

@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "scope",
         nargs="?",
-        choices=("current", "all", "plugin-cache", "plugins", "skills"),
+        choices=("current", "all", "plugin-cache", "plugins", "skills", "p", "s"),
         default="current",
         help=(
             "repair the current database, every database, or mount cached "
@@ -95,11 +95,13 @@ def parse_args() -> argparse.Namespace:
         help="keep historical provider labels instead of normalizing them",
     )
     parser.add_argument(
+        "-A",
         "--apply",
         action="store_true",
         help="for plugin-cache: create missing skill symlinks instead of dry-run",
     )
     parser.add_argument(
+        "-n",
         "--dry-run",
         action="store_true",
         help="for plugins/skills: preview cached skill mounts without writing",
@@ -117,6 +119,7 @@ def parse_args() -> argparse.Namespace:
         help="for plugin-cache: target skills root",
     )
     parser.add_argument(
+        "-s",
         "--source",
         action="append",
         help=(
@@ -125,6 +128,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-v",
         "--visible-mounts",
         action="store_true",
         help=(
@@ -133,6 +137,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-S",
         "--skip-symlinks",
         action="store_true",
         help="for plugin-cache: only create visible wrapper mounts, not top-level symlinks",
@@ -1012,7 +1017,7 @@ def run_all(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
-    if args.scope in {"plugins", "skills"}:
+    if args.scope in {"plugins", "skills", "p", "s"}:
         args.visible_mounts = True
         args.skip_symlinks = True
         args.apply = not args.dry_run
