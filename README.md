@@ -21,6 +21,8 @@ or synchronize every discovered database, including CodexBar managed homes.
 - Optionally normalizes historical provider labels to `openai`.
 - Finds the standard database, a legacy root database, an explicitly configured
   `CODEX_SQLITE_HOME`, and CodexBar managed databases.
+- Promotes cached Codex plugin skills into `~/.codex/skills` with safe symlinks
+  via `cxfix plugin-cache`.
 
 It does not upload conversation data and does not copy rollout contents to
 GitHub or any remote service.
@@ -114,6 +116,44 @@ Prepare the database and let Codex perform backfill after reopening:
 ```bash
 cxfix all -y --prepare-only
 ```
+
+Mount all cached plugin skills visibly into Codex:
+
+```bash
+cxfix plugins
+```
+
+Preview what would be mounted without writing:
+
+```bash
+cxfix plugins --dry-run
+```
+
+Advanced: create missing top-level symlinks under `~/.codex/skills`:
+
+```bash
+cxfix plugin-cache --apply
+```
+
+Advanced: only expose one cached plugin source, such as the primary runtime
+Office-style skills:
+
+```bash
+cxfix plugin-cache --source openai-primary-runtime --apply
+```
+
+The generated visible names use this shape:
+
+```text
+cache:<skill>:<hash>
+```
+
+`plugin-cache` is idempotent. It skips ambiguous duplicate names and refuses to
+overwrite existing non-symlink skill directories. Visible mounts are generated
+under `~/.codex/skills/_cache_plugin_mounts/` and point back to the original
+cached `SKILL.md`, so official cache files are not modified. The short hash
+keeps generated skill names under Codex's 64-character limit while preserving
+the full source path inside the wrapper body.
 
 By default, provider labels are normalized to `openai`. This helps recover
 threads hidden by provider filtering, but it is a deliberate data change. Use

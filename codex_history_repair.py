@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pty
@@ -15,8 +16,10 @@ import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 
 CODEX_HOME = Path.home() / ".codex"
@@ -31,6 +34,20 @@ RUNTIME_DIR = CODEX_HOME / "session-repair-runtime"
 APP_CODEX = Path("/Applications/Codex.app/Contents/Resources/codex")
 ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 OFFICIAL_PROVIDER = "openai"
+PLUGIN_CACHE_ROOT = CODEX_HOME / "plugins" / "cache"
+SKILLS_ROOT = CODEX_HOME / "skills"
+VISIBLE_MOUNT_ROOT_NAME = "_cache_plugin_mounts"
+
+
+@dataclass(frozen=True)
+class PluginSkillCandidate:
+    link_name: str
+    skill_dir: Path
+    skill_file: Path
+    source: str
+    plugin: str
+    version: str
+    display_name: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,9 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "scope",
         nargs="?",
-        choices=("current", "all"),
+        choices=("current", "all", "plugin-cache", "plugins", "skills"),
         default="current",
-        help="repair the current state database, or every discovered database",
+        help=(
+            "repair the current database, every database, or mount cached "
+            "plugin skills"
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -74,7 +94,315 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="keep historical provider labels instead of normalizing them",
     )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="for plugin-cache: create missing skill symlinks instead of dry-run",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="for plugins/skills: preview cached skill mounts without writing",
+    )
+    parser.add_argument(
+        "--cache-root",
+        type=Path,
+        default=PLUGIN_CACHE_ROOT,
+        help="for plugin-cache: cached plugin root",
+    )
+    parser.add_argument(
+        "--skills-root",
+        type=Path,
+        default=SKILLS_ROOT,
+        help="for plugin-cache: target skills root",
+    )
+    parser.add_argument(
+        "--source",
+        action="append",
+        help=(
+            "for plugin-cache: only promote one cache source, e.g. "
+            "openai-primary-runtime; may be repeated"
+        ),
+    )
+    parser.add_argument(
+        "--visible-mounts",
+        action="store_true",
+        help=(
+            "for plugin-cache: create namespaced wrapper skills for every "
+            "cached plugin skill, including conflicts"
+        ),
+    )
+    parser.add_argument(
+        "--skip-symlinks",
+        action="store_true",
+        help="for plugin-cache: only create visible wrapper mounts, not top-level symlinks",
+    )
     return parser.parse_args()
+
+
+def parse_skill_frontmatter_name(skill_file: Path) -> str | None:
+    try:
+        text = skill_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None
+    for line in text[3:end].splitlines():
+        if line.strip().startswith("name:"):
+            return line.split(":", 1)[1].strip().strip("\"'") or None
+    return None
+
+
+def safe_skill_link_name(name: str) -> str:
+    normalized = name.strip().lower()
+    normalized = re.sub(r"[^a-z0-9._-]+", "-", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized
+
+
+def plugin_skill_source(skill_dir: Path, cache_root: Path) -> tuple[str, str, str]:
+    rel = skill_dir.relative_to(cache_root)
+    parts = rel.parts
+    source = parts[0] if len(parts) > 0 else "unknown"
+    plugin = parts[1] if len(parts) > 1 else "unknown"
+    version = parts[2] if len(parts) > 2 else "unknown"
+    return source, plugin, version
+
+
+def discover_cached_plugin_skills(cache_root: Path) -> list[PluginSkillCandidate]:
+    candidates: list[PluginSkillCandidate] = []
+    for skill_file in cache_root.rglob("SKILL.md"):
+        if "/skills/" not in skill_file.as_posix():
+            continue
+        skill_dir = skill_file.parent
+        source, plugin, version = plugin_skill_source(skill_dir, cache_root)
+        display_name = parse_skill_frontmatter_name(skill_file) or skill_dir.name
+        link_name = safe_skill_link_name(skill_dir.name) or safe_skill_link_name(display_name)
+        if not link_name:
+            continue
+        candidates.append(
+            PluginSkillCandidate(
+                link_name=link_name,
+                skill_dir=skill_dir,
+                skill_file=skill_file,
+                source=source,
+                plugin=plugin,
+                version=version,
+                display_name=display_name,
+            )
+        )
+    return sorted(candidates, key=lambda c: (c.link_name, c.source, c.plugin, c.version))
+
+
+def choose_plugin_skill_candidates(
+    candidates: Iterable[PluginSkillCandidate],
+) -> tuple[list[PluginSkillCandidate], list[list[PluginSkillCandidate]]]:
+    by_name: dict[str, list[PluginSkillCandidate]] = {}
+    for candidate in candidates:
+        by_name.setdefault(candidate.link_name, []).append(candidate)
+
+    chosen: list[PluginSkillCandidate] = []
+    ambiguous: list[list[PluginSkillCandidate]] = []
+    for _, group in sorted(by_name.items()):
+        real_dirs = {candidate.skill_dir.resolve() for candidate in group}
+        if len(real_dirs) == 1:
+            chosen.append(group[-1])
+            continue
+        primary = [candidate for candidate in group if candidate.source == "openai-primary-runtime"]
+        if primary and len({candidate.skill_dir.resolve() for candidate in primary}) == 1:
+            chosen.append(primary[-1])
+        else:
+            ambiguous.append(group)
+    return chosen, ambiguous
+
+
+def cached_plugin_skill_status(
+    candidate: PluginSkillCandidate, skills_root: Path
+) -> tuple[str, str]:
+    link = skills_root / candidate.link_name
+    target = candidate.skill_dir.resolve()
+    if not link.exists() and not link.is_symlink():
+        return "create", f"{link} -> {target}"
+    if link.is_symlink():
+        current = link.resolve()
+        if current == target:
+            return "ok", f"{link} already points to {target}"
+        return "conflict", f"{link} points to {current}, wanted {target}"
+    return "conflict", f"{link} exists and is not a symlink"
+
+
+def visible_mount_dir(candidate: PluginSkillCandidate, skills_root: Path) -> Path:
+    return (
+        skills_root
+        / VISIBLE_MOUNT_ROOT_NAME
+        / safe_skill_link_name(candidate.source)
+        / safe_skill_link_name(candidate.plugin)
+        / safe_skill_link_name(candidate.version)
+        / candidate.link_name
+    )
+
+
+def visible_mount_name(candidate: PluginSkillCandidate) -> str:
+    identity = (
+        f"{candidate.source}:{candidate.plugin}:"
+        f"{candidate.version}:{candidate.link_name}"
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
+    prefix = safe_skill_link_name(candidate.link_name)[:46].strip("-")
+    return f"cache:{prefix}:{digest}"
+
+
+def visible_mount_content(candidate: PluginSkillCandidate) -> str:
+    original_skill = candidate.skill_file.resolve()
+    original_dir = candidate.skill_dir.resolve()
+    skill_name = visible_mount_name(candidate)
+    description = (
+        f"Visible mount for cached Codex plugin skill {candidate.display_name!r} "
+        f"from {candidate.source}/{candidate.plugin}/{candidate.version}."
+    )
+    return f"""---
+name: {json.dumps(skill_name)}
+description: {json.dumps(description)}
+---
+
+# Cached Plugin Skill Mount
+
+This is a generated visible mount for a cached Codex plugin skill.
+
+- Original skill name: `{candidate.display_name}`
+- Original skill file: `{original_skill}`
+- Original skill directory: `{original_dir}`
+- Cache source: `{candidate.source}`
+- Plugin: `{candidate.plugin}`
+- Version: `{candidate.version}`
+
+When this mounted skill is selected, read the original `SKILL.md` above
+completely, then follow that skill's instructions. Resolve any relative files,
+scripts, references, templates, or assets relative to the original skill
+directory, not this generated mount directory.
+
+Do not edit this generated mount by hand. Re-run `cxfix plugin-cache
+--visible-mounts --apply` to refresh it.
+"""
+
+
+def visible_mount_status(
+    candidate: PluginSkillCandidate, skills_root: Path
+) -> tuple[str, str, Path, str]:
+    mount_dir = visible_mount_dir(candidate, skills_root)
+    mount_file = mount_dir / "SKILL.md"
+    content = visible_mount_content(candidate)
+    if not mount_file.exists():
+        return "create", f"{mount_file} wraps {candidate.skill_file.resolve()}", mount_file, content
+    try:
+        current = mount_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "conflict", f"{mount_file} exists but cannot be read", mount_file, content
+    if current == content:
+        return "ok", f"{mount_file} already wraps {candidate.skill_file.resolve()}", mount_file, content
+    if "This is a generated visible mount for a cached Codex plugin skill." in current:
+        return "update", f"{mount_file} will be refreshed", mount_file, content
+    return "conflict", f"{mount_file} exists and is not a generated mount", mount_file, content
+
+
+def run_plugin_cache(args: argparse.Namespace) -> int:
+    cache_root = args.cache_root.expanduser()
+    skills_root = args.skills_root.expanduser()
+    if not cache_root.exists():
+        print(f"cache root not found: {cache_root}", file=sys.stderr)
+        return 2
+    if args.apply:
+        skills_root.mkdir(parents=True, exist_ok=True)
+
+    discovered = discover_cached_plugin_skills(cache_root)
+    if args.source:
+        allowed_sources = set(args.source)
+        discovered = [
+            candidate
+            for candidate in discovered
+            if candidate.source in allowed_sources
+        ]
+    candidates, ambiguous = choose_plugin_skill_candidates(discovered)
+    creates = oks = conflicts = 0
+    if not args.skip_symlinks:
+        for candidate in candidates:
+            state, message = cached_plugin_skill_status(candidate, skills_root)
+            if state == "create":
+                creates += 1
+                if args.apply:
+                    (skills_root / candidate.link_name).symlink_to(
+                        candidate.skill_dir.resolve(), target_is_directory=True
+                    )
+            elif state == "ok":
+                oks += 1
+            else:
+                conflicts += 1
+            label = {"create": "CREATE", "ok": "OK", "conflict": "CONFLICT"}[state]
+            print(f"{label:8} {candidate.link_name:32} {message}")
+    else:
+        print("Top-level symlink promotion skipped.")
+
+    visible_creates = visible_updates = visible_oks = visible_conflicts = 0
+    if args.visible_mounts:
+        print("\nVisible mounts:")
+        for candidate in discovered:
+            state, message, mount_file, content = visible_mount_status(
+                candidate, skills_root
+            )
+            if state == "create":
+                visible_creates += 1
+            elif state == "update":
+                visible_updates += 1
+            elif state == "ok":
+                visible_oks += 1
+            else:
+                visible_conflicts += 1
+
+            if args.apply and state in {"create", "update"}:
+                mount_file.parent.mkdir(parents=True, exist_ok=True)
+                mount_file.write_text(content, encoding="utf-8")
+
+            label = {
+                "create": "CREATE",
+                "update": "UPDATE",
+                "ok": "OK",
+                "conflict": "CONFLICT",
+            }[state]
+            print(f"{label:8} {visible_mount_name(candidate):64} {message}")
+
+    if ambiguous and not args.skip_symlinks:
+        print("\nAMBIGUOUS cached skill names skipped for top-level symlinks:")
+        for group in ambiguous:
+            print(f"- {group[0].link_name}")
+            for candidate in group:
+                print(
+                    f"  {candidate.source}/{candidate.plugin}/{candidate.version}: "
+                    f"{candidate.skill_dir}"
+                )
+
+    mode = "applied" if args.apply else "dry-run"
+    top_symlink_ambiguous = 0 if args.skip_symlinks else len(ambiguous)
+    print(
+        f"\nSummary ({mode}): create={creates}, ok={oks}, "
+        f"conflict={conflicts}, top_symlink_ambiguous={top_symlink_ambiguous}, "
+        f"visible_create={visible_creates}, visible_update={visible_updates}, "
+        f"visible_ok={visible_oks}, visible_conflict={visible_conflicts}"
+    )
+    if not args.apply and creates and not args.skip_symlinks:
+        print("Run again with: cxfix plugin-cache --apply")
+    if not args.apply and args.visible_mounts and (visible_creates or visible_updates):
+        command = "cxfix plugin-cache --visible-mounts --apply"
+        if args.skip_symlinks:
+            command = "cxfix plugin-cache --visible-mounts --skip-symlinks --apply"
+        print(f"Run again with: {command}")
+    if args.apply and visible_conflicts:
+        return 1
+    if args.apply and not args.visible_mounts and (conflicts or ambiguous):
+        return 1
+    return 0
 
 
 def discover_state_databases(
@@ -684,6 +1012,13 @@ def run_all(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    if args.scope in {"plugins", "skills"}:
+        args.visible_mounts = True
+        args.skip_symlinks = True
+        args.apply = not args.dry_run
+        return run_plugin_cache(args)
+    if args.scope == "plugin-cache":
+        return run_plugin_cache(args)
     if args.scope == "all":
         return run_all(args)
     return run_single(args)
