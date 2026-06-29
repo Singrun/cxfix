@@ -79,6 +79,19 @@ class ParseArgsTests(unittest.TestCase):
 
         self.assertTrue(args.clean_encrypted)
 
+    def test_display_config_option_is_accepted(self):
+        with mock.patch("sys.argv", ["cxfix", "-d", "--json"]):
+            args = repair.parse_args()
+
+        self.assertTrue(args.display_config)
+        self.assertTrue(args.json)
+
+    def test_provider_switch_option_is_accepted(self):
+        with mock.patch("sys.argv", ["cxfix", "-p", "aimai1"]):
+            args = repair.parse_args()
+
+        self.assertEqual(args.provider, "aimai1")
+
     def test_path_scope_and_cwd_options_are_accepted(self):
         with mock.patch(
             "sys.argv",
@@ -188,6 +201,57 @@ model_provider = "ignored"
                 actual = repair.configured_sqlite_home(codex_home=codex_home)
 
         self.assertEqual(actual, env_home)
+
+    def test_switch_provider_updates_top_level_and_backs_up(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.toml"
+            backup_root = root / "backups"
+            config.write_text(
+                """
+model_provider = "old"
+
+[model_providers.old]
+name = "Old"
+
+[model_providers.new]
+name = "New"
+
+[profiles.keep]
+model_provider = "old"
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(repair, "CODEX_CONFIG", config), mock.patch.object(
+                repair, "BACKUP_ROOT", backup_root
+            ):
+                result = repair.switch_provider("new")
+            text = config.read_text(encoding="utf-8")
+            backup_exists = Path(result["backup"]).is_file()
+
+        self.assertEqual(result["previous_provider"], "old")
+        self.assertEqual(result["new_provider"], "new")
+        self.assertTrue(backup_exists)
+        self.assertIn('model_provider = "new"', text.splitlines()[0])
+        self.assertIn('model_provider = "old"', text)
+
+    def test_switch_provider_rejects_unknown_provider(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "config.toml"
+            config.write_text(
+                """
+model_provider = "old"
+
+[model_providers.old]
+name = "Old"
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(repair, "CODEX_CONFIG", config):
+                with self.assertRaises(ValueError):
+                    repair.switch_provider("missing")
 
 
 class DiscoverStateDatabasesTests(unittest.TestCase):

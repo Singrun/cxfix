@@ -23,9 +23,18 @@ from typing import Iterable
 
 from cxfix.core.codex_home import CodexHome, configured_sqlite_home
 from cxfix.core.config import (
+    backup_config,
     configured_model_provider as read_configured_model_provider,
     configured_top_level_string as read_configured_top_level_string,
+    load_toml_config,
+    mcp_server_names,
     parse_toml_string,
+    plugin_names,
+    profile_names,
+    project_paths,
+    provider_names,
+    redact_config,
+    replace_top_level_string,
 )
 
 CODEX_HOME_CONTEXT = CodexHome.discover()
@@ -137,6 +146,22 @@ def parse_args() -> argparse.Namespace:
             "remove provider-specific encrypted reasoning payloads from rollout "
             "history after backing them up"
         ),
+    )
+    parser.add_argument(
+        "-d",
+        "--display-config",
+        action="store_true",
+        help="display a redacted summary of the current Codex configuration",
+    )
+    parser.add_argument(
+        "-p",
+        "--provider",
+        help="switch top-level model_provider in ~/.codex/config.toml",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON for display-oriented commands",
     )
     parser.add_argument(
         "--from-cwd",
@@ -1103,6 +1128,124 @@ def provider_counts() -> dict[str, int]:
         connection.close()
 
 
+def state_summary() -> dict[str, object]:
+    summary: dict[str, object] = {
+        "state_db": str(STATE_DB),
+        "state_db_exists": STATE_DB.is_file(),
+    }
+    if not STATE_DB.is_file():
+        return summary
+    connection = connect(readonly=True)
+    try:
+        summary["quick_check"] = connection.execute("PRAGMA quick_check").fetchone()[0]
+        summary["thread_count"] = connection.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+        summary["provider_counts"] = provider_counts()
+    finally:
+        connection.close()
+    return summary
+
+
+def config_summary() -> dict[str, object]:
+    config = load_toml_config(CODEX_CONFIG)
+    active_provider = configured_model_provider()
+    profiles = profile_names(config)
+    providers = provider_names(config)
+    plugins = plugin_names(config)
+    mcp_servers = mcp_server_names(config)
+    projects = project_paths(config)
+    return {
+        "codex_home": str(CODEX_HOME),
+        "config": str(CODEX_CONFIG),
+        "config_exists": CODEX_CONFIG.is_file(),
+        "sqlite_home": str(SQLITE_HOME),
+        "active_provider": active_provider,
+        "providers": providers,
+        "profiles": profiles,
+        "plugins": plugins,
+        "mcp_servers": mcp_servers,
+        "projects": projects,
+        "features": redact_config(config.get("features", {})),
+        "desktop": redact_config(config.get("desktop", {})),
+        "redacted_config": redact_config(config),
+        "state": state_summary(),
+    }
+
+
+def print_list(name: str, values: list[str], *, limit: int = 80) -> None:
+    print(f"{name}={len(values)}")
+    for value in values[:limit]:
+        print(f"  - {value}")
+    if len(values) > limit:
+        print(f"  ... {len(values) - limit} more")
+
+
+def run_display_config(args: argparse.Namespace) -> int:
+    summary = config_summary()
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"codex_home={summary['codex_home']}")
+    print(f"config={summary['config']} exists={summary['config_exists']}")
+    print(f"sqlite_home={summary['sqlite_home']}")
+    print(f"active_provider={summary['active_provider'] or '<unset>'}")
+    state = summary["state"]
+    if isinstance(state, dict):
+        print(f"state_db={state.get('state_db')} exists={state.get('state_db_exists')}")
+        if "quick_check" in state:
+            print(f"state_quick_check={state['quick_check']}")
+        if "thread_count" in state:
+            print(f"threads={state['thread_count']}")
+        if "provider_counts" in state:
+            print("thread_provider_counts=" + json.dumps(state["provider_counts"], ensure_ascii=False))
+    print_list("providers", summary["providers"])
+    print_list("profiles", summary["profiles"])
+    print_list("plugins", summary["plugins"])
+    print_list("mcp_servers", summary["mcp_servers"])
+    print_list("projects", summary["projects"], limit=30)
+    print("features=" + json.dumps(summary["features"], ensure_ascii=False))
+    print("desktop=" + json.dumps(summary["desktop"], ensure_ascii=False))
+    return 0
+
+
+def switch_provider(provider_label: str) -> dict[str, object]:
+    config = load_toml_config(CODEX_CONFIG)
+    providers = provider_names(config)
+    if providers and provider_label not in providers:
+        raise ValueError(
+            f"unknown provider {provider_label!r}; available providers: "
+            + ", ".join(providers)
+        )
+    previous = configured_model_provider()
+    backup_path = backup_config(CODEX_CONFIG, BACKUP_ROOT)
+    replace_top_level_string(CODEX_CONFIG, "model_provider", provider_label)
+    return {
+        "config": str(CODEX_CONFIG),
+        "backup": str(backup_path),
+        "previous_provider": previous,
+        "new_provider": provider_label,
+    }
+
+
+def run_provider_switch(args: argparse.Namespace) -> int:
+    if not CODEX_CONFIG.is_file():
+        print(f"Codex config is missing: {CODEX_CONFIG}", file=sys.stderr)
+        return 2
+    try:
+        result = switch_provider(args.provider)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"config={result['config']}")
+        print(f"backup={result['backup']}")
+        print(f"previous_provider={result['previous_provider'] or '<unset>'}")
+        print(f"new_provider={result['new_provider']}")
+    return 0
+
+
 def rollout_has_user_event(path: Path) -> bool:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -1561,6 +1704,10 @@ def run_all(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    if args.display_config:
+        return run_display_config(args)
+    if args.provider:
+        return run_provider_switch(args)
     if args.scope in {"plugins", "skills", "p", "s"}:
         args.visible_mounts = True
         args.skip_symlinks = True

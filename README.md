@@ -97,6 +97,28 @@ to continue if it detects an active Codex process.
 
 Quit Codex Desktop before running a repair.
 
+Display the current Codex configuration, state paths, providers, profiles,
+plugins, MCP servers, projects, and thread provider counts:
+
+```bash
+cxfix -d
+```
+
+Emit the same summary as redacted JSON:
+
+```bash
+cxfix -d --json
+```
+
+The JSON output also includes the full parsed config under `redacted_config`,
+with secrets such as API keys and tokens replaced by `<redacted>`.
+
+Switch the top-level Codex provider after backing up `config.toml`:
+
+```bash
+cxfix -p aimai1
+```
+
 Repair the current configured database:
 
 ```bash
@@ -169,6 +191,9 @@ Mount all cached plugin skills visibly into Codex:
 ```bash
 cxfix p
 ```
+
+`cxfix p` mounts plugin skills. `cxfix -p PROVIDER` switches the active
+top-level provider in `~/.codex/config.toml`.
 
 Preview what would be mounted without writing:
 

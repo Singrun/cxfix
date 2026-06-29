@@ -4,7 +4,15 @@ from pathlib import Path
 from unittest import mock
 
 from cxfix.core.codex_home import CodexHome, configured_sqlite_home, default_codex_home
-from cxfix.core.config import configured_model_provider, configured_top_level_string
+from cxfix.core.config import (
+    backup_config,
+    configured_model_provider,
+    configured_top_level_string,
+    load_toml_config,
+    provider_names,
+    redact_config,
+    replace_top_level_string,
+)
 
 
 class CoreConfigTests(unittest.TestCase):
@@ -26,6 +34,74 @@ model_provider = "ignored"
 
     def test_ignores_missing_config(self):
         self.assertIsNone(configured_model_provider(Path("/tmp/missing-cxfix-config.toml")))
+
+    def test_load_toml_and_provider_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "config.toml"
+            config.write_text(
+                """
+[model_providers.alpha]
+name = "Alpha"
+
+[model_providers.beta]
+name = "Beta"
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            loaded = load_toml_config(config)
+
+        self.assertEqual(provider_names(loaded), ["alpha", "beta"])
+
+    def test_redact_config_hides_secret_keys(self):
+        redacted = redact_config(
+            {
+                "model_providers": {
+                    "alpha": {
+                        "api_key": "secret",
+                        "base_url": "https://example.test",
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(redacted["model_providers"]["alpha"]["api_key"], "<redacted>")
+        self.assertEqual(
+            redacted["model_providers"]["alpha"]["base_url"],
+            "https://example.test",
+        )
+
+    def test_replace_top_level_string_updates_before_tables(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "config.toml"
+            config.write_text(
+                """
+model_provider = "old"
+
+[profiles.old]
+model_provider = "profile-old"
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            replace_top_level_string(config, "model_provider", "new")
+            text = config.read_text(encoding="utf-8")
+
+        self.assertIn('model_provider = "new"', text.splitlines()[0])
+        self.assertIn('model_provider = "profile-old"', text)
+
+    def test_backup_config_copies_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "config.toml"
+            config.write_text('model_provider = "old"\n', encoding="utf-8")
+
+            backup = backup_config(config, root / "backups")
+            backup_exists = backup.is_file()
+            backup_text = backup.read_text(encoding="utf-8")
+
+        self.assertTrue(backup_exists)
+        self.assertEqual(backup_text, 'model_provider = "old"\n')
 
 
 class CodexHomeTests(unittest.TestCase):
