@@ -23,9 +23,63 @@ from typing import Iterable
 
 
 CODEX_HOME = Path.home() / ".codex"
-SQLITE_HOME = Path(
-    os.environ.get("CODEX_SQLITE_HOME", CODEX_HOME / "sqlite")
-).expanduser()
+CODEX_CONFIG = CODEX_HOME / "config.toml"
+TOP_LEVEL_TOML_STRING = re.compile(r"^\s*{key}\s*=\s*(.+?)\s*(?:#.*)?$")
+
+
+def parse_toml_string(value: str) -> str | None:
+    text = value.strip()
+    if not text:
+        return None
+    quote = text[0]
+    if quote in {'"', "'"}:
+        end = text.find(quote, 1)
+        if end == -1:
+            return None
+        raw = text[: end + 1]
+        if quote == '"':
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        return raw[1:-1]
+    return text.split()[0] or None
+
+
+def configured_top_level_string(key: str, config_path: Path | None = None) -> str | None:
+    path = config_path or CODEX_CONFIG
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+
+    matcher = re.compile(TOP_LEVEL_TOML_STRING.pattern.format(key=re.escape(key)))
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("["):
+            return None
+        match = matcher.match(line)
+        if match:
+            return parse_toml_string(match.group(1))
+    return None
+
+
+def configured_sqlite_home(
+    codex_home: Path = CODEX_HOME,
+    config_path: Path | None = None,
+) -> Path:
+    env_value = os.environ.get("CODEX_SQLITE_HOME")
+    if env_value:
+        return Path(env_value).expanduser()
+    configured = configured_top_level_string("sqlite_home", config_path or codex_home / "config.toml")
+    if configured:
+        return Path(configured).expanduser()
+    return codex_home
+
+
+SQLITE_HOME = configured_sqlite_home()
 STATE_DB = SQLITE_HOME / "state_5.sqlite"
 SESSIONS = CODEX_HOME / "sessions"
 SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
@@ -33,10 +87,16 @@ BACKUP_ROOT = CODEX_HOME / "backups" / "session-history-repair"
 RUNTIME_DIR = CODEX_HOME / "session-repair-runtime"
 APP_CODEX = Path("/Applications/Codex.app/Contents/Resources/codex")
 ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-OFFICIAL_PROVIDER = "openai"
+DEFAULT_PROVIDER = "openai"
 PLUGIN_CACHE_ROOT = CODEX_HOME / "plugins" / "cache"
 SKILLS_ROOT = CODEX_HOME / "skills"
 VISIBLE_MOUNT_ROOT_NAME = "_cache_plugin_mounts"
+ENCRYPTED_CONTENT_KEYS = {
+    "encrypted_content",
+    "encryptedContent",
+    "encrypted_reasoning_content",
+    "encryptedReasoningContent",
+}
 
 
 @dataclass(frozen=True)
@@ -57,7 +117,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "scope",
         nargs="?",
-        choices=("current", "all", "plugin-cache", "plugins", "skills", "p", "s"),
+        choices=(
+            "current",
+            "all",
+            "plugin-cache",
+            "plugins",
+            "skills",
+            "p",
+            "s",
+            "encrypted-content",
+            "encrypted",
+            "e",
+        ),
         default="current",
         help=(
             "repair the current database, every database, or mount cached "
@@ -86,13 +157,32 @@ def parse_args() -> argparse.Namespace:
         dest="official_only",
         action="store_true",
         default=True,
-        help="normalize every non-openai history entry to the official openai provider",
+        help=(
+            "normalize every history entry to the active configured provider "
+            "(kept for compatibility with older cxfix releases)"
+        ),
     )
     parser.add_argument(
         "--preserve-providers",
         dest="official_only",
         action="store_false",
         help="keep historical provider labels instead of normalizing them",
+    )
+    parser.add_argument(
+        "--target-provider",
+        help=(
+            "provider label to normalize history to; defaults to the top-level "
+            "model_provider in ~/.codex/config.toml, then openai"
+        ),
+    )
+    parser.add_argument(
+        "-e",
+        "--clean-encrypted",
+        action="store_true",
+        help=(
+            "remove provider-specific encrypted reasoning payloads from rollout "
+            "history after backing them up"
+        ),
     )
     parser.add_argument(
         "-A",
@@ -143,6 +233,14 @@ def parse_args() -> argparse.Namespace:
         help="for plugin-cache: only create visible wrapper mounts, not top-level symlinks",
     )
     return parser.parse_args()
+
+
+def configured_model_provider(config_path: Path | None = None) -> str | None:
+    return configured_top_level_string("model_provider", config_path)
+
+
+def target_provider(args: argparse.Namespace) -> str:
+    return args.target_provider or configured_model_provider() or DEFAULT_PROVIDER
 
 
 def parse_skill_frontmatter_name(skill_file: Path) -> str | None:
@@ -424,13 +522,14 @@ def discover_state_databases(
         / "managed-codex-homes"
     )
     candidates = [
-        codex_home / "sqlite" / "state_5.sqlite",
+        configured_sqlite_home(codex_home) / "state_5.sqlite",
         codex_home / "state_5.sqlite",
+        codex_home / "sqlite" / "state_5.sqlite",
     ]
-    configured_sqlite_home = os.environ.get("CODEX_SQLITE_HOME")
-    if configured_sqlite_home:
+    configured_sqlite_home_env = os.environ.get("CODEX_SQLITE_HOME")
+    if configured_sqlite_home_env:
         candidates.append(
-            Path(configured_sqlite_home).expanduser() / "state_5.sqlite"
+            Path(configured_sqlite_home_env).expanduser() / "state_5.sqlite"
         )
     if managed_root.is_dir():
         candidates.extend(sorted(managed_root.glob("*/state_5.sqlite")))
@@ -592,7 +691,9 @@ def backup_and_mark_pending() -> tuple[Path, int, int]:
     return backup_dir, before_count, missing_before
 
 
-def normalize_rollout_file(path: Path, backup_path: Path) -> str | None:
+def normalize_rollout_file(
+    path: Path, backup_path: Path, provider_label: str
+) -> str | None:
     temp_path = path.with_name(path.name + ".cxfix.tmp")
     changed_provider: str | None = None
     changed = False
@@ -607,10 +708,10 @@ def normalize_rollout_file(path: Path, backup_path: Path) -> str | None:
         if item.get("type") == "session_meta":
             payload = item.get("payload") or {}
             provider = payload.get("model_provider")
-            if provider != OFFICIAL_PROVIDER:
+            if provider != provider_label:
                 changed_provider = provider or "<missing>"
                 changed = True
-                payload["model_provider"] = OFFICIAL_PROVIDER
+                payload["model_provider"] = provider_label
                 item["payload"] = payload
                 line = json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
         updated_lines.append(line)
@@ -631,14 +732,18 @@ def normalize_rollout_file(path: Path, backup_path: Path) -> str | None:
     return changed_provider
 
 
-def normalize_legacy_providers(backup_dir: Path) -> dict[str, object]:
+def normalize_legacy_providers(
+    backup_dir: Path, provider_label: str
+) -> dict[str, object]:
     changed_files: list[str] = []
     original_counts: dict[str, int] = {}
     rollout_backup_root = backup_dir / "rollouts"
 
     for path in sorted(SESSIONS.rglob("*.jsonl")):
         relative = path.relative_to(SESSIONS)
-        provider = normalize_rollout_file(path, rollout_backup_root / relative)
+        provider = normalize_rollout_file(
+            path, rollout_backup_root / relative, provider_label
+        )
         if provider is not None:
             original_counts[provider] = original_counts.get(provider, 0) + 1
             changed_files.append(str(relative))
@@ -654,7 +759,7 @@ def normalize_legacy_providers(backup_dir: Path) -> dict[str, object]:
                 WHERE model_provider <> ?
                 GROUP BY model_provider
                 """,
-                (OFFICIAL_PROVIDER,),
+                (provider_label,),
             )
         }
         with connection:
@@ -664,18 +769,100 @@ def normalize_legacy_providers(backup_dir: Path) -> dict[str, object]:
                 SET model_provider = ?
                 WHERE model_provider <> ?
                 """,
-                (OFFICIAL_PROVIDER, OFFICIAL_PROVIDER),
+                (provider_label, provider_label),
             )
         updated_rows = cursor.rowcount
     finally:
         connection.close()
 
     return {
-        "target_provider": OFFICIAL_PROVIDER,
+        "target_provider": provider_label,
         "rollout_files_changed": len(changed_files),
         "rollout_original_provider_counts": original_counts,
         "database_rows_changed": updated_rows,
         "database_original_provider_counts": before_rows,
+        "changed_rollouts": changed_files,
+    }
+
+
+def remove_encrypted_content(value: object) -> int:
+    removed = 0
+    if isinstance(value, dict):
+        for key in list(value):
+            if key in ENCRYPTED_CONTENT_KEYS:
+                value.pop(key, None)
+                removed += 1
+        for child in value.values():
+            removed += remove_encrypted_content(child)
+    elif isinstance(value, list):
+        for child in value:
+            removed += remove_encrypted_content(child)
+    return removed
+
+
+def clean_encrypted_rollout_file(path: Path, backup_path: Path) -> int:
+    temp_path = path.with_name(path.name + ".cxfix.tmp")
+    removed = 0
+    changed = False
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("r", encoding="utf-8") as source:
+        lines = source.readlines()
+
+    updated_lines: list[str] = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            updated_lines.append(line)
+            continue
+        line_removed = remove_encrypted_content(item)
+        if line_removed:
+            changed = True
+            removed += line_removed
+            line = json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+        updated_lines.append(line)
+
+    if not changed:
+        return 0
+
+    shutil.copy2(path, backup_path)
+    try:
+        with temp_path.open("w", encoding="utf-8") as target:
+            target.writelines(updated_lines)
+            target.flush()
+            os.fsync(target.fileno())
+        shutil.copystat(path, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return removed
+
+
+def rollout_roots() -> list[Path]:
+    roots = [SESSIONS]
+    archived = CODEX_HOME / "archived_sessions"
+    if archived.is_dir():
+        roots.append(archived)
+    return [root for root in roots if root.is_dir()]
+
+
+def clean_encrypted_rollouts(backup_dir: Path) -> dict[str, object]:
+    changed_files: list[str] = []
+    removed_fields = 0
+    backup_root = backup_dir / "encrypted-rollouts"
+
+    for root in rollout_roots():
+        for path in sorted(root.rglob("*.jsonl")):
+            relative = path.relative_to(CODEX_HOME)
+            removed = clean_encrypted_rollout_file(path, backup_root / relative)
+            if removed:
+                removed_fields += removed
+                changed_files.append(str(relative))
+
+    return {
+        "removed_fields": removed_fields,
+        "rollout_files_changed": len(changed_files),
         "changed_rollouts": changed_files,
     }
 
@@ -905,12 +1092,24 @@ def run_single(args: argparse.Namespace) -> int:
     print(f"threads_before={before_count} missing_rollouts_before={missing_before}")
 
     normalization = None
+    encrypted_cleanup = None
+    provider_label = target_provider(args)
     if args.official_only:
-        normalization = normalize_legacy_providers(backup_dir)
+        normalization = normalize_legacy_providers(backup_dir, provider_label)
         print(
+            f"target_provider={provider_label} "
             "normalized_rollouts="
             f"{normalization['rollout_files_changed']} "
             f"normalized_database_rows={normalization['database_rows_changed']}"
+        )
+
+    if args.clean_encrypted:
+        encrypted_cleanup = clean_encrypted_rollouts(backup_dir)
+        print(
+            "encrypted_fields_removed="
+            f"{encrypted_cleanup['removed_fields']} "
+            "encrypted_rollouts_changed="
+            f"{encrypted_cleanup['rollout_files_changed']}"
         )
 
     user_event_reconciliation = reconcile_user_event_flags()
@@ -921,10 +1120,11 @@ def run_single(args: argparse.Namespace) -> int:
     )
 
     if args.prepare_only:
-        if normalization is not None:
+        if normalization is not None or encrypted_cleanup is not None:
             manifest_path = backup_dir / "manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["provider_normalization"] = normalization
+            manifest["encrypted_cleanup"] = encrypted_cleanup
             manifest["user_event_reconciliation"] = user_event_reconciliation
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -950,6 +1150,7 @@ def run_single(args: argparse.Namespace) -> int:
             "thread_count_after": after_count,
             "rollouts_missing_from_database_after": sorted(missing_after),
             "provider_normalization": normalization,
+            "encrypted_cleanup": encrypted_cleanup,
             "user_event_reconciliation": user_event_reconciliation,
             "provider_counts_after": provider_counts(),
         }
@@ -961,7 +1162,7 @@ def run_single(args: argparse.Namespace) -> int:
 
     counts_after = provider_counts()
     legacy_remaining = (
-        sum(count for provider, count in counts_after.items() if provider != OFFICIAL_PROVIDER)
+        sum(count for provider, count in counts_after.items() if provider != provider_label)
         if args.official_only
         else 0
     )
@@ -999,6 +1200,10 @@ def run_all(args: argparse.Namespace) -> int:
         command.append(
             "--official-only" if args.official_only else "--preserve-providers"
         )
+        if args.target_provider:
+            command.extend(["--target-provider", args.target_provider])
+        if args.clean_encrypted:
+            command.append("--clean-encrypted")
         env = os.environ.copy()
         env["CODEX_SQLITE_HOME"] = str(database.parent)
         result = subprocess.run(command, env=env)
@@ -1024,6 +1229,8 @@ def main() -> int:
         return run_plugin_cache(args)
     if args.scope == "plugin-cache":
         return run_plugin_cache(args)
+    if args.scope in {"encrypted-content", "encrypted", "e"}:
+        args.clean_encrypted = True
     if args.scope == "all":
         return run_all(args)
     return run_single(args)

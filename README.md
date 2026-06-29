@@ -18,9 +18,14 @@ or synchronize every discovered database, including CodexBar managed homes.
 - Backs up each database before making changes.
 - Rebuilds missing thread index rows from local rollout files.
 - Reconciles `has_user_event` flags from actual user messages.
-- Optionally normalizes historical provider labels to `openai`.
-- Finds the standard database, a legacy root database, an explicitly configured
-  `CODEX_SQLITE_HOME`, and CodexBar managed databases.
+- Optionally normalizes historical provider labels to the active configured
+  provider, or to an explicit `--target-provider`.
+- Optionally removes provider-specific encrypted reasoning payloads that can
+  break when a thread switches between official OpenAI and third-party routed
+  APIs.
+- Finds the current configured database, the legacy `~/.codex/sqlite`
+  database, an explicitly configured `CODEX_SQLITE_HOME`, and CodexBar managed
+  databases.
 - Promotes cached Codex plugin skills into `~/.codex/skills` with safe symlinks
   via `cxfix plugin-cache`.
 
@@ -58,8 +63,7 @@ python3 install.py
 source ~/.zshrc
 ```
 
-The installer adds `~/.local/bin` to `PATH`, sets the standard SQLite home, and
-creates the `cxfix` alias.
+The installer adds `~/.local/bin` to `PATH` and creates the `cxfix` alias.
 
 ## Recommended zsh Configuration
 
@@ -68,7 +72,6 @@ The installer manages this block in `~/.zshrc`:
 ```zsh
 # >>> codex session history repair >>>
 export PATH="$HOME/.local/bin:$PATH"
-export CODEX_SQLITE_HOME="$HOME/.codex/sqlite"
 alias cxfix="codex-history-repair"
 # <<< codex session history repair <<<
 ```
@@ -76,7 +79,7 @@ alias cxfix="codex-history-repair"
 Useful optional shortcuts:
 
 ```zsh
-# Repair the official/current database.
+# Repair the current configured database.
 alias cxfix-now='cxfix -y'
 
 # Synchronize every discovered Codex database.
@@ -93,7 +96,7 @@ to continue if it detects an active Codex process.
 
 Quit Codex Desktop before running a repair.
 
-Repair the current database:
+Repair the current configured database:
 
 ```bash
 cxfix -y
@@ -111,10 +114,28 @@ Keep existing provider labels:
 cxfix all -y --preserve-providers
 ```
 
+Normalize to a specific provider label:
+
+```bash
+cxfix all -y --target-provider aimai1
+```
+
 Prepare the database and let Codex perform backfill after reopening:
 
 ```bash
 cxfix all -y --prepare-only
+```
+
+Clean encrypted reasoning payloads after provider switching errors:
+
+```bash
+cxfix e -y
+```
+
+Run encrypted cleanup together with a full history repair:
+
+```bash
+cxfix all -y -e
 ```
 
 Mount all cached plugin skills visibly into Codex:
@@ -162,9 +183,24 @@ cached `SKILL.md`, so official cache files are not modified. The short hash
 keeps generated skill names under Codex's 64-character limit while preserving
 the full source path inside the wrapper body.
 
-By default, provider labels are normalized to `openai`. This helps recover
-threads hidden by provider filtering, but it is a deliberate data change. Use
-`--preserve-providers` when provider-specific history separation matters.
+By default, provider labels are normalized to the top-level `model_provider` in
+`~/.codex/config.toml`, falling back to `openai` when no provider is configured.
+This helps recover threads hidden by provider filtering, but it is a deliberate
+data change. Use `--target-provider PROVIDER` to choose the label explicitly,
+or `--preserve-providers` when provider-specific history separation matters.
+
+When a thread has used both official OpenAI APIs and third-party routed APIs,
+Codex may replay provider-specific `encrypted_content` from the older turn.
+Official OpenAI endpoints can reject those payloads with errors such as
+`Encrypted content could not be decrypted or parsed`. `cxfix e` backs up the
+affected rollout files and removes only the encrypted reasoning fields, while
+preserving visible messages, summaries, tool calls, and ordinary content.
+
+Codex stores SQLite-backed state under `CODEX_HOME` by default. `cxfix`
+follows the same order for the current database: `CODEX_SQLITE_HOME`, then
+top-level `sqlite_home` in `~/.codex/config.toml`, then `CODEX_HOME`. Set
+`CODEX_SQLITE_HOME` only when you intentionally want to repair a non-default
+state directory.
 
 ## Backups
 

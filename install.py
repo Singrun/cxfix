@@ -16,7 +16,6 @@ END = "# <<< codex session history repair <<<"
 BLOCK = f"""\
 {START}
 export PATH="$HOME/.local/bin:$PATH"
-export CODEX_SQLITE_HOME="$HOME/.codex/sqlite"
 alias cxfix="codex-history-repair"
 {END}
 """

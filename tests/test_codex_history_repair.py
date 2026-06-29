@@ -59,6 +59,105 @@ class ParseArgsTests(unittest.TestCase):
         self.assertTrue(args.visible_mounts)
         self.assertTrue(args.skip_symlinks)
 
+    def test_target_provider_option_is_accepted(self):
+        with mock.patch("sys.argv", ["cxfix", "all", "--target-provider", "aimai1"]):
+            args = repair.parse_args()
+
+        self.assertEqual(args.target_provider, "aimai1")
+
+    def test_short_encrypted_cleanup_scope_is_accepted(self):
+        with mock.patch("sys.argv", ["cxfix", "e"]):
+            args = repair.parse_args()
+
+        self.assertEqual(args.scope, "e")
+
+    def test_clean_encrypted_option_is_accepted(self):
+        with mock.patch("sys.argv", ["cxfix", "all", "-e"]):
+            args = repair.parse_args()
+
+        self.assertTrue(args.clean_encrypted)
+
+
+class ProviderConfigurationTests(unittest.TestCase):
+    def test_reads_top_level_model_provider(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "config.toml"
+            config.write_text(
+                """
+# Managed header
+model_provider = "aimai1"
+
+[profiles.legacy]
+model_provider = "ignored"
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            actual = repair.configured_model_provider(config)
+
+        self.assertEqual(actual, "aimai1")
+
+    def test_ignores_profile_only_model_provider(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "config.toml"
+            config.write_text(
+                """
+[profiles.legacy]
+model_provider = "ignored"
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            actual = repair.configured_model_provider(config)
+
+        self.assertIsNone(actual)
+
+    def test_explicit_target_provider_wins(self):
+        args = mock.Mock(target_provider="custom")
+
+        self.assertEqual(repair.target_provider(args), "custom")
+
+    def test_configured_sqlite_home_defaults_to_codex_home(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            codex_home.mkdir()
+
+            with mock.patch.dict("os.environ", {}, clear=True):
+                actual = repair.configured_sqlite_home(codex_home=codex_home)
+
+        self.assertEqual(actual, codex_home)
+
+    def test_configured_sqlite_home_reads_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            configured = Path(temp_dir) / "state"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                f'sqlite_home = "{configured}"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict("os.environ", {}, clear=True):
+                actual = repair.configured_sqlite_home(codex_home=codex_home)
+
+        self.assertEqual(actual, configured)
+
+    def test_configured_sqlite_home_prefers_env(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            configured = Path(temp_dir) / "configured"
+            env_home = Path(temp_dir) / "env"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                f'sqlite_home = "{configured}"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict("os.environ", {"CODEX_SQLITE_HOME": str(env_home)}, clear=True):
+                actual = repair.configured_sqlite_home(codex_home=codex_home)
+
+        self.assertEqual(actual, env_home)
+
 
 class DiscoverStateDatabasesTests(unittest.TestCase):
     def test_finds_real_codex_databases_and_excludes_backups(self):
@@ -73,8 +172,8 @@ class DiscoverStateDatabasesTests(unittest.TestCase):
                 / "managed-codex-homes"
             )
             expected = [
-                codex_home / "sqlite" / "state_5.sqlite",
                 codex_home / "state_5.sqlite",
+                codex_home / "sqlite" / "state_5.sqlite",
                 managed_root / "profile-a" / "state_5.sqlite",
             ]
             ignored = codex_home / "backups" / "old" / "state_5.sqlite"
@@ -133,6 +232,51 @@ class DiscoverCachedPluginSkillsTests(unittest.TestCase):
         self.assertTrue(name.startswith("cache:presentations:"))
         self.assertIn(f'name: "{name}"', content)
         self.assertIn("Original skill file:", content)
+
+
+class CleanEncryptedContentTests(unittest.TestCase):
+    def test_remove_encrypted_content_recurses_without_touching_text(self):
+        payload = {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"text": "keep me"}],
+                "encrypted_content": "secret",
+                "nested": [{"encryptedContent": "secret2", "text": "visible"}],
+            },
+        }
+
+        removed = repair.remove_encrypted_content(payload)
+
+        self.assertEqual(removed, 2)
+        self.assertNotIn("encrypted_content", payload["payload"])
+        self.assertNotIn("encryptedContent", payload["payload"]["nested"][0])
+        self.assertEqual(payload["payload"]["summary"][0]["text"], "keep me")
+        self.assertEqual(payload["payload"]["nested"][0]["text"], "visible")
+
+    def test_clean_encrypted_rollout_file_backs_up_and_rewrites(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rollout = root / "rollout.jsonl"
+            backup = root / "backup" / "rollout.jsonl"
+            rollout.write_text(
+                (
+                    '{"type":"response_item","payload":{"type":"reasoning",'
+                    '"summary":[],"encrypted_content":"secret"}}\n'
+                    '{"type":"event_msg","payload":{"message":"visible"}}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            removed = repair.clean_encrypted_rollout_file(rollout, backup)
+            rewritten = rollout.read_text(encoding="utf-8")
+            backed_up = backup.is_file()
+
+        self.assertEqual(removed, 1)
+        self.assertTrue(backed_up)
+        self.assertIn('"summary":[]', rewritten)
+        self.assertIn('"message":"visible"', rewritten)
+        self.assertNotIn("encrypted_content", rewritten)
 
 
 if __name__ == "__main__":
