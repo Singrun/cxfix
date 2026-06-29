@@ -73,7 +73,7 @@ The installer manages this block in `~/.zshrc`:
 ```zsh
 # >>> codex session history repair >>>
 export PATH="$HOME/.local/bin:$PATH"
-alias cxfix="codex-history-repair"
+alias cxfix="noglob codex-history-repair"
 # <<< codex session history repair <<<
 ```
 
@@ -96,6 +96,15 @@ to continue if it detects an active Codex process.
 ## Usage
 
 Quit Codex Desktop before running a repair.
+
+Show all commands and common examples:
+
+```bash
+cxfix -?
+```
+
+The installer uses a `noglob` alias so `-?` works in zsh instead of being
+treated as a filename pattern.
 
 Display the current Codex configuration, state paths, providers, profiles,
 plugins, MCP servers, projects, and thread provider counts:

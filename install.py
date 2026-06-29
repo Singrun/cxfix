@@ -18,7 +18,7 @@ END = "# <<< codex session history repair <<<"
 BLOCK = f"""\
 {START}
 export PATH="$HOME/.local/bin:$PATH"
-alias cxfix="codex-history-repair"
+alias cxfix="noglob codex-history-repair"
 {END}
 """
 

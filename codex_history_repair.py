@@ -72,8 +72,54 @@ class PluginSkillCandidate:
 
 
 def parse_args() -> argparse.Namespace:
+    usage_examples = """
+Common commands:
+  cxfix -?                                  Show this full help.
+  cxfix -d                                  Display redacted Codex config/state summary.
+  cxfix -d --json                           Display redacted machine-readable config JSON.
+  cxfix -p PROVIDER                         Switch top-level model_provider after backup.
+
+Session and provider repair:
+  cxfix -y                                  Repair the current configured Codex database.
+  cxfix all -y                              Repair every discovered Codex database.
+  cxfix all -y --preserve-providers         Keep historical provider labels.
+  cxfix all -y --target-provider PROVIDER   Normalize threads to an explicit provider.
+  cxfix all -y --prepare-only               Mark backfill pending without launching Codex.
+
+Encrypted reasoning cleanup:
+  cxfix e -y                                Remove encrypted reasoning payloads from rollouts.
+  cxfix all -y -e                           Run encrypted cleanup with full history repair.
+
+Thread cwd/path repair:
+  cxfix path --list-cwd                     List known thread working directories.
+  cxfix path --list-cwd --contains-cwd TEXT Filter cwd list.
+  cxfix path --from-cwd '～/dev/know '      Preview exact cwd migration.
+  cxfix path --from-cwd '～/dev/know ' --apply -y
+                                             Apply cwd migration and align provider.
+  cxfix path --from-cwd OLD --to-cwd NEW --target-provider PROVIDER --apply -y
+                                             Choose replacement cwd and provider explicitly.
+
+Plugin skill cache:
+  cxfix p                                   Mount cached plugin skills visibly.
+  cxfix p -n                                Preview visible plugin skill mounts.
+  cxfix plugin-cache -A                     Create top-level cached skill symlinks.
+  cxfix plugin-cache -s SOURCE -A           Promote one cache source.
+
+Notes:
+  - Mutating repair commands create backups under ~/.codex/backups/session-history-repair/.
+  - Quit Codex Desktop before mutating repairs.
+  - Quote cwd values that contain trailing spaces.
+  - 'cxfix p' mounts plugin skills; 'cxfix -p PROVIDER' switches provider.
+"""
     parser = argparse.ArgumentParser(
-        description="Back up and rebuild the local Codex session/provider index."
+        description="Back up, inspect, and repair local Codex config, threads, providers, and plugin state.",
+        epilog=usage_examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-?",
+        action="help",
+        help="show this full help message and exit",
     )
     parser.add_argument(
         "scope",

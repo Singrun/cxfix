@@ -1,9 +1,11 @@
 import importlib.util
+import io
 import json
 import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -17,6 +19,21 @@ SPEC.loader.exec_module(repair)
 
 
 class ParseArgsTests(unittest.TestCase):
+    def test_question_mark_help_lists_commands(self):
+        output = io.StringIO()
+        with mock.patch("sys.argv", ["cxfix", "-?"]):
+            with redirect_stdout(output):
+                with self.assertRaises(SystemExit) as raised:
+                    repair.parse_args()
+
+        self.assertEqual(raised.exception.code, 0)
+        text = output.getvalue()
+        self.assertIn("Common commands:", text)
+        self.assertIn("cxfix -d", text)
+        self.assertIn("cxfix -p PROVIDER", text)
+        self.assertIn("cxfix path --list-cwd", text)
+        self.assertIn("cxfix plugin-cache -A", text)
+
     def test_all_scope_is_accepted(self):
         with mock.patch("sys.argv", ["cxfix", "all", "-y"]):
             args = repair.parse_args()
