@@ -58,6 +58,12 @@ ENCRYPTED_CONTENT_KEYS = {
     "encrypted_reasoning_content",
     "encryptedReasoningContent",
 }
+SCOPE_CURRENT = "@current"
+SCOPE_ALL = "@all"
+SCOPE_ENCRYPTED = "@encrypted"
+SCOPE_PATH = "@path"
+SCOPE_PLUGINS = "@plugins"
+SCOPE_PLUGIN_CACHE = "@plugin-cache"
 
 
 @dataclass(frozen=True)
@@ -71,45 +77,92 @@ class PluginSkillCandidate:
     display_name: str
 
 
-def parse_args() -> argparse.Namespace:
+def normalize_argv(argv: list[str]) -> list[str]:
+    if not argv:
+        return argv
+
+    command = argv[0]
+    rest = argv[1:]
+
+    if command == "fix":
+        return [SCOPE_CURRENT, *rest]
+
+    if command == "fix-all":
+        return [SCOPE_ALL, *rest]
+
+    if command == "clean":
+        return [SCOPE_ENCRYPTED, *rest]
+
+    if command == "config":
+        if rest and rest[0] == "show":
+            rest = rest[1:]
+        return ["--display-config", *rest]
+
+    if command == "provider":
+        if rest and rest[0] == "switch":
+            rest = rest[1:]
+        if rest:
+            return ["--provider", rest[0], *rest[1:]]
+        return ["--display-config"]
+
+    if command == "path" and rest:
+        path_action = rest[0]
+        path_rest = rest[1:]
+        if path_action == "list":
+            return [SCOPE_PATH, "-l", *path_rest]
+        if path_action == "migrate":
+            return [SCOPE_PATH, *path_rest]
+
+    if command == "plugins" and rest:
+        plugin_action = rest[0]
+        plugin_rest = rest[1:]
+        if plugin_action == "mount":
+            return [SCOPE_PLUGINS, *plugin_rest]
+        if plugin_action == "cache":
+            return [SCOPE_PLUGIN_CACHE, *plugin_rest]
+
+    return argv
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     usage_examples = """
-Common commands:
+Recommended commands:
   cxfix -?                                  Show this full help.
-  cxfix -d                                  Display redacted Codex config/state summary.
-  cxfix -d --json                           Display redacted machine-readable config JSON.
-  cxfix -p PROVIDER                         Switch top-level model_provider after backup.
+  cxfix config show                         Display redacted Codex config/state summary.
+  cxfix config show -j                      Display redacted machine-readable config JSON.
+  cxfix provider switch PROVIDER            Switch top-level model_provider after backup.
 
 Session and provider repair:
-  cxfix -y                                  Repair the current configured Codex database.
-  cxfix all -y                              Repair every discovered Codex database.
-  cxfix all -y --preserve-providers         Keep historical provider labels.
-  cxfix all -y --target-provider PROVIDER   Normalize threads to an explicit provider.
-  cxfix all -y --prepare-only               Mark backfill pending without launching Codex.
+  cxfix fix -y                              Repair the current configured Codex database.
+  cxfix fix-all -y                          Repair every discovered Codex database.
+  cxfix fix-all -y -k                       Keep historical provider labels.
+  cxfix fix-all -y -g PROVIDER
+                                             Normalize threads to an explicit provider.
+  cxfix fix-all -y -r                       Mark backfill pending without launching Codex.
 
 Encrypted reasoning cleanup:
-  cxfix e -y                                Remove encrypted reasoning payloads from rollouts.
-  cxfix all -y -e                           Run encrypted cleanup with full history repair.
+  cxfix clean -y                            Remove encrypted reasoning payloads from rollouts.
+  cxfix fix-all -y -e                       Run encrypted cleanup with full history repair.
 
 Thread cwd/path repair:
-  cxfix path --list-cwd                     List known thread working directories.
-  cxfix path --list-cwd --contains-cwd TEXT Filter cwd list.
-  cxfix path --from-cwd '～/dev/know '      Preview exact cwd migration.
-  cxfix path --from-cwd '～/dev/know ' --apply -y
+  cxfix path list                           List known thread working directories.
+  cxfix path list -c TEXT                   Filter cwd list.
+  cxfix path migrate -f '～/dev/know '      Preview exact cwd migration.
+  cxfix path migrate -f '～/dev/know ' -a -y
                                              Apply cwd migration and align provider.
-  cxfix path --from-cwd OLD --to-cwd NEW --target-provider PROVIDER --apply -y
+  cxfix path migrate -f OLD -o NEW -g PROVIDER -a -y
                                              Choose replacement cwd and provider explicitly.
 
 Plugin skill cache:
-  cxfix p                                   Mount cached plugin skills visibly.
-  cxfix p -n                                Preview visible plugin skill mounts.
-  cxfix plugin-cache -A                     Create top-level cached skill symlinks.
-  cxfix plugin-cache -s SOURCE -A           Promote one cache source.
+  cxfix plugins mount                       Mount cached plugin skills visibly.
+  cxfix plugins mount -n                    Preview visible plugin skill mounts.
+  cxfix plugins cache -a                    Create top-level cached skill symlinks.
+  cxfix plugins cache -s SOURCE -a          Promote one cache source.
 
 Notes:
   - Mutating repair commands create backups under ~/.codex/backups/session-history-repair/.
   - Quit Codex Desktop before mutating repairs.
   - Quote cwd values that contain trailing spaces.
-  - 'cxfix p' mounts plugin skills; 'cxfix -p PROVIDER' switches provider.
 """
     parser = argparse.ArgumentParser(
         description="Back up, inspect, and repair local Codex config, threads, providers, and plugin state.",
@@ -122,35 +175,21 @@ Notes:
         help="show this full help message and exit",
     )
     parser.add_argument(
-        "scope",
+        "command",
         nargs="?",
-        choices=(
-            "current",
-            "all",
-            "plugin-cache",
-            "plugins",
-            "skills",
-            "p",
-            "s",
-            "encrypted-content",
-            "encrypted",
-            "e",
-            "path",
-            "paths",
-        ),
-        default="current",
-        help=(
-            "repair the current database, every database, or mount cached "
-            "plugin skills"
-        ),
+        default=SCOPE_CURRENT,
+        metavar="command",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "-t",
         "--timeout",
         type=int,
         default=900,
         help="maximum seconds to wait for the official backfill (default: 900)",
     )
     parser.add_argument(
+        "-r",
         "--prepare-only",
         action="store_true",
         help="back up and mark the index pending, but do not launch the bundled CLI",
@@ -161,23 +200,16 @@ Notes:
         action="store_true",
         help="terminate orphaned app-servers without prompting",
     )
+    parser.set_defaults(official_only=True)
     parser.add_argument(
-        "--official-only",
-        dest="official_only",
-        action="store_true",
-        default=True,
-        help=(
-            "normalize every history entry to the active configured provider "
-            "(kept for compatibility with older cxfix releases)"
-        ),
-    )
-    parser.add_argument(
+        "-k",
         "--preserve-providers",
         dest="official_only",
         action="store_false",
         help="keep historical provider labels instead of normalizing them",
     )
     parser.add_argument(
+        "-g",
         "--target-provider",
         help=(
             "provider label to normalize history to; defaults to the top-level "
@@ -205,11 +237,13 @@ Notes:
         help="switch top-level model_provider in ~/.codex/config.toml",
     )
     parser.add_argument(
+        "-j",
         "--json",
         action="store_true",
         help="emit machine-readable JSON for display-oriented commands",
     )
     parser.add_argument(
+        "-f",
         "--from-cwd",
         help=(
             "for path repair: exact thread cwd to migrate; quote values with "
@@ -217,6 +251,7 @@ Notes:
         ),
     )
     parser.add_argument(
+        "-o",
         "--to-cwd",
         help=(
             "for path repair: replacement cwd; defaults to a canonicalized "
@@ -224,16 +259,18 @@ Notes:
         ),
     )
     parser.add_argument(
+        "-l",
         "--list-cwd",
         action="store_true",
         help="for path repair: list thread cwd values instead of migrating",
     )
     parser.add_argument(
+        "-c",
         "--contains-cwd",
         help="for path repair --list-cwd: only show cwd values containing this text",
     )
     parser.add_argument(
-        "-A",
+        "-a",
         "--apply",
         action="store_true",
         help="for plugin-cache: create missing skill symlinks instead of dry-run",
@@ -245,12 +282,14 @@ Notes:
         help="for plugins/skills: preview cached skill mounts without writing",
     )
     parser.add_argument(
+        "-b",
         "--cache-root",
         type=Path,
         default=PLUGIN_CACHE_ROOT,
         help="for plugin-cache: cached plugin root",
     )
     parser.add_argument(
+        "-u",
         "--skills-root",
         type=Path,
         default=SKILLS_ROOT,
@@ -266,7 +305,7 @@ Notes:
         ),
     )
     parser.add_argument(
-        "-v",
+        "-m",
         "--visible-mounts",
         action="store_true",
         help=(
@@ -275,12 +314,24 @@ Notes:
         ),
     )
     parser.add_argument(
-        "-S",
+        "-x",
         "--skip-symlinks",
         action="store_true",
         help="for plugin-cache: only create visible wrapper mounts, not top-level symlinks",
     )
-    return parser.parse_args()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(normalize_argv(raw_argv))
+    known_commands = {
+        SCOPE_CURRENT,
+        SCOPE_ALL,
+        SCOPE_ENCRYPTED,
+        SCOPE_PATH,
+        SCOPE_PLUGINS,
+        SCOPE_PLUGIN_CACHE,
+    }
+    if args.command not in known_commands:
+        parser.error("unknown command; run 'cxfix -?' to see supported commands")
+    return args
 
 
 def configured_model_provider(config_path: Path | None = None) -> str | None:
@@ -456,8 +507,8 @@ completely, then follow that skill's instructions. Resolve any relative files,
 scripts, references, templates, or assets relative to the original skill
 directory, not this generated mount directory.
 
-Do not edit this generated mount by hand. Re-run `cxfix plugin-cache
---visible-mounts --apply` to refresh it.
+Do not edit this generated mount by hand. Re-run `cxfix plugins cache -m -a`
+to refresh it.
 """
 
 
@@ -564,11 +615,11 @@ def run_plugin_cache(args: argparse.Namespace) -> int:
         f"visible_ok={visible_oks}, visible_conflict={visible_conflicts}"
     )
     if not args.apply and creates and not args.skip_symlinks:
-        print("Run again with: cxfix plugin-cache --apply")
+        print("Run again with: cxfix plugins cache -a")
     if not args.apply and args.visible_mounts and (visible_creates or visible_updates):
-        command = "cxfix plugin-cache --visible-mounts --apply"
+        command = "cxfix plugins cache -m -a"
         if args.skip_symlinks:
-            command = "cxfix plugin-cache --visible-mounts --skip-symlinks --apply"
+            command = "cxfix plugins cache -m -x -a"
         print(f"Run again with: {command}")
     if args.apply and visible_conflicts:
         return 1
@@ -1724,14 +1775,13 @@ def run_all(args: argparse.Namespace) -> int:
             "-y",
         ]
         if args.prepare_only:
-            command.append("--prepare-only")
-        command.append(
-            "--official-only" if args.official_only else "--preserve-providers"
-        )
+            command.append("-r")
+        if not args.official_only:
+            command.append("-k")
         if args.target_provider:
-            command.extend(["--target-provider", args.target_provider])
+            command.extend(["-g", args.target_provider])
         if args.clean_encrypted:
-            command.append("--clean-encrypted")
+            command.append("-e")
         env = os.environ.copy()
         env["CODEX_SQLITE_HOME"] = str(database.parent)
         result = subprocess.run(command, env=env)
@@ -1754,18 +1804,18 @@ def main() -> int:
         return run_display_config(args)
     if args.provider:
         return run_provider_switch(args)
-    if args.scope in {"plugins", "skills", "p", "s"}:
+    if args.command == SCOPE_PLUGINS:
         args.visible_mounts = True
         args.skip_symlinks = True
         args.apply = not args.dry_run
         return run_plugin_cache(args)
-    if args.scope == "plugin-cache":
+    if args.command == SCOPE_PLUGIN_CACHE:
         return run_plugin_cache(args)
-    if args.scope in {"encrypted-content", "encrypted", "e"}:
+    if args.command == SCOPE_ENCRYPTED:
         args.clean_encrypted = True
-    if args.scope in {"path", "paths"}:
+    if args.command == SCOPE_PATH:
         return run_path_migration(args)
-    if args.scope == "all":
+    if args.command == SCOPE_ALL:
         return run_all(args)
     return run_single(args)
 

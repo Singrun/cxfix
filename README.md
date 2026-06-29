@@ -1,5 +1,7 @@
 # cxfix
 
+[中文说明](README.zh-CN.md)
+
 `cxfix` repairs the local Codex Desktop session index when existing conversations
 do not appear in the desktop history.
 
@@ -27,7 +29,7 @@ or synchronize every discovered database, including CodexBar managed homes.
   database, an explicitly configured `CODEX_SQLITE_HOME`, and CodexBar managed
   databases.
 - Promotes cached Codex plugin skills into `~/.codex/skills` with safe symlinks
-  via `cxfix plugin-cache`.
+  via `cxfix plugins cache`.
 
 It does not upload conversation data and does not copy rollout contents to
 GitHub or any remote service.
@@ -81,13 +83,13 @@ Useful optional shortcuts:
 
 ```zsh
 # Repair the current configured database.
-alias cxfix-now='cxfix -y'
+alias cxfix-now='cxfix fix -y'
 
 # Synchronize every discovered Codex database.
-alias cxfix-all='cxfix all -y'
+alias cxfix-all='cxfix fix-all -y'
 
 # Preserve third-party provider labels.
-alias cxfix-keep='cxfix all -y --preserve-providers'
+alias cxfix-keep='cxfix fix-all -y -k'
 ```
 
 Do not run these aliases while Codex Desktop is open. The utility will refuse
@@ -110,13 +112,13 @@ Display the current Codex configuration, state paths, providers, profiles,
 plugins, MCP servers, projects, and thread provider counts:
 
 ```bash
-cxfix -d
+cxfix config show
 ```
 
 Emit the same summary as redacted JSON:
 
 ```bash
-cxfix -d --json
+cxfix config show -j
 ```
 
 The JSON output also includes the full parsed config under `redacted_config`,
@@ -125,109 +127,99 @@ with secrets such as API keys and tokens replaced by `<redacted>`.
 Switch the top-level Codex provider after backing up `config.toml`:
 
 ```bash
-cxfix -p aimai1
+cxfix provider switch aimai1
 ```
 
 Repair the current configured database:
 
 ```bash
-cxfix -y
+cxfix fix -y
 ```
 
 Repair every discovered database:
 
 ```bash
-cxfix all -y
+cxfix fix-all -y
 ```
 
 Keep existing provider labels:
 
 ```bash
-cxfix all -y --preserve-providers
+cxfix fix-all -y -k
 ```
 
 Normalize to a specific provider label:
 
 ```bash
-cxfix all -y --target-provider aimai1
+cxfix fix-all -y -g aimai1
 ```
 
 Prepare the database and let Codex perform backfill after reopening:
 
 ```bash
-cxfix all -y --prepare-only
+cxfix fix-all -y -r
 ```
 
 Clean encrypted reasoning payloads after provider switching errors:
 
 ```bash
-cxfix e -y
+cxfix clean -y
 ```
 
 Run encrypted cleanup together with a full history repair:
 
 ```bash
-cxfix all -y -e
+cxfix fix-all -y -e
 ```
 
 Preview a thread path migration without writing:
 
 ```bash
-cxfix path --from-cwd '～/dev/know '
+cxfix path migrate -f '～/dev/know '
 ```
 
 List known thread working directories before choosing a migration:
 
 ```bash
-cxfix path --list-cwd --contains-cwd know
+cxfix path list -c know
 ```
 
 Apply the path migration and align matching threads to the current configured
 provider:
 
 ```bash
-cxfix path --from-cwd '～/dev/know ' --apply -y
+cxfix path migrate -f '～/dev/know ' -a -y
 ```
 
 Choose the replacement path and provider explicitly:
 
 ```bash
-cxfix path --from-cwd '～/dev/know ' --to-cwd '~/dev/know' --target-provider aimai1 --apply -y
+cxfix path migrate -f '～/dev/know ' -o '~/dev/know' -g aimai1 -a -y
 ```
 
 Mount all cached plugin skills visibly into Codex:
 
 ```bash
-cxfix p
+cxfix plugins mount
 ```
-
-`cxfix p` mounts plugin skills. `cxfix -p PROVIDER` switches the active
-top-level provider in `~/.codex/config.toml`.
 
 Preview what would be mounted without writing:
 
 ```bash
-cxfix p -n
-```
-
-Long aliases are still available:
-
-```bash
-cxfix plugins
-cxfix plugins --dry-run
+cxfix plugins mount -n
 ```
 
 Advanced: create missing top-level symlinks under `~/.codex/skills`:
 
 ```bash
-cxfix plugin-cache -A
+cxfix plugins cache -a
 ```
 
 Advanced: only expose one cached plugin source, such as the primary runtime
 Office-style skills:
 
 ```bash
-cxfix plugin-cache -s openai-primary-runtime -A
+cxfix plugins cache -s openai-primary-runtime -a
 ```
 
 The generated visible names use this shape:
@@ -246,24 +238,25 @@ the full source path inside the wrapper body.
 By default, provider labels are normalized to the top-level `model_provider` in
 `~/.codex/config.toml`, falling back to `openai` when no provider is configured.
 This helps recover threads hidden by provider filtering, but it is a deliberate
-data change. Use `--target-provider PROVIDER` to choose the label explicitly,
-or `--preserve-providers` when provider-specific history separation matters.
+data change. Use `-g PROVIDER` / `--target-provider PROVIDER` to choose the
+label explicitly, or `-k` / `--preserve-providers` when provider-specific
+history separation matters.
 
 When a thread has used both official OpenAI APIs and third-party routed APIs,
 Codex may replay provider-specific `encrypted_content` from the older turn.
 Official OpenAI endpoints can reject those payloads with errors such as
-`Encrypted content could not be decrypted or parsed`. `cxfix e` backs up the
-affected rollout files and removes only the encrypted reasoning fields, while
-preserving visible messages, summaries, tool calls, and ordinary content.
+`Encrypted content could not be decrypted or parsed`. `cxfix clean` backs up
+the affected rollout files and removes only the encrypted reasoning fields,
+while preserving visible messages, summaries, tool calls, and ordinary content.
 
 `cxfix path` repairs thread working-directory drift. It updates matching
 `threads.cwd` rows in SQLite and the corresponding rollout `session_meta.cwd`
-values, backing up both before writes. By default, `--to-cwd` is derived from
-`--from-cwd` by replacing a leading full-width `～` with `~`, expanding the home
-directory, and stripping surrounding whitespace. The source value is matched
-exactly after `~` expansion, so paths with trailing spaces must be quoted in the
-shell. Provider labels are aligned to the current configured provider unless
-`--preserve-providers` is used.
+values, backing up both before writes. By default, `-o` / `--to-cwd` is derived
+from `-f` / `--from-cwd` by replacing a leading full-width `～` with `~`,
+expanding the home directory, and stripping surrounding whitespace. The source
+value is matched exactly after `~` expansion, so paths with trailing spaces must
+be quoted in the shell. Provider labels are aligned to the current configured
+provider unless `-k` / `--preserve-providers` is used.
 
 Codex stores SQLite-backed state under `CODEX_HOME` by default. `cxfix`
 follows Codex's precedence for the current database: top-level `sqlite_home` in

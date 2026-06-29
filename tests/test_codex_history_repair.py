@@ -5,7 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -28,50 +28,72 @@ class ParseArgsTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 0)
         text = output.getvalue()
-        self.assertIn("Common commands:", text)
-        self.assertIn("cxfix -d", text)
-        self.assertIn("cxfix -p PROVIDER", text)
-        self.assertIn("cxfix path --list-cwd", text)
-        self.assertIn("cxfix plugin-cache -A", text)
+        self.assertIn("Recommended commands:", text)
+        self.assertIn("cxfix config show", text)
+        self.assertIn("cxfix provider switch PROVIDER", text)
+        self.assertIn("cxfix fix-all -y", text)
+        self.assertIn("cxfix path list", text)
+        self.assertIn("cxfix plugins cache -a", text)
 
-    def test_all_scope_is_accepted(self):
-        with mock.patch("sys.argv", ["cxfix", "all", "-y"]):
-            args = repair.parse_args()
+    def test_config_show_normalizes_to_display_config(self):
+        args = repair.parse_args(["config", "show", "-j"])
 
-        self.assertEqual(args.scope, "all")
+        self.assertTrue(args.display_config)
+        self.assertTrue(args.json)
+
+    def test_provider_switch_normalizes_to_provider_option(self):
+        args = repair.parse_args(["provider", "switch", "aimai1"])
+
+        self.assertEqual(args.provider, "aimai1")
+
+    def test_repair_all_normalizes_to_all_scope(self):
+        args = repair.parse_args(["fix-all", "-y"])
+
+        self.assertEqual(args.command, repair.SCOPE_ALL)
         self.assertTrue(args.yes)
 
-    def test_plugin_cache_scope_is_accepted(self):
-        with mock.patch(
-            "sys.argv",
-            ["cxfix", "plugin-cache", "--apply", "--visible-mounts"],
-        ):
-            args = repair.parse_args()
+    def test_fix_normalizes_to_current_scope(self):
+        args = repair.parse_args(["fix", "-y"])
 
-        self.assertEqual(args.scope, "plugin-cache")
+        self.assertEqual(args.command, repair.SCOPE_CURRENT)
+        self.assertTrue(args.yes)
+
+    def test_clean_normalizes_to_encrypted_scope(self):
+        args = repair.parse_args(["clean", "-y"])
+
+        self.assertEqual(args.command, repair.SCOPE_ENCRYPTED)
+        self.assertTrue(args.yes)
+
+    def test_path_list_normalizes_to_list_cwd(self):
+        args = repair.parse_args(["path", "list", "-c", "know"])
+
+        self.assertEqual(args.command, repair.SCOPE_PATH)
+        self.assertTrue(args.list_cwd)
+        self.assertEqual(args.contains_cwd, "know")
+
+    def test_path_migrate_normalizes_from_and_to_options(self):
+        args = repair.parse_args(["path", "migrate", "-f", "old ", "-o", "new"])
+
+        self.assertEqual(args.command, repair.SCOPE_PATH)
+        self.assertEqual(args.from_cwd, "old ")
+        self.assertEqual(args.to_cwd, "new")
+
+    def test_plugins_cache_normalizes_to_plugin_cache_scope(self):
+        args = repair.parse_args(["plugins", "cache", "-a"])
+
+        self.assertEqual(args.command, repair.SCOPE_PLUGIN_CACHE)
         self.assertTrue(args.apply)
-        self.assertTrue(args.visible_mounts)
 
-    def test_plugins_scope_is_accepted(self):
-        with mock.patch("sys.argv", ["cxfix", "plugins", "--dry-run"]):
-            args = repair.parse_args()
+    def test_plugins_mount_normalizes_to_visible_mounts(self):
+        args = repair.parse_args(["plugins", "mount", "-n"])
 
-        self.assertEqual(args.scope, "plugins")
-        self.assertTrue(args.dry_run)
-
-    def test_short_plugins_scope_and_dry_run_are_accepted(self):
-        with mock.patch("sys.argv", ["cxfix", "p", "-n"]):
-            args = repair.parse_args()
-
-        self.assertEqual(args.scope, "p")
+        self.assertEqual(args.command, repair.SCOPE_PLUGINS)
         self.assertTrue(args.dry_run)
 
     def test_short_plugin_cache_options_are_accepted(self):
-        with mock.patch(
-            "sys.argv",
-            ["cxfix", "plugin-cache", "-s", "openai-primary-runtime", "-A", "-v", "-S"],
-        ):
-            args = repair.parse_args()
+        args = repair.parse_args(
+            ["plugins", "cache", "-s", "openai-primary-runtime", "-a", "-m", "-x"]
+        )
 
         self.assertEqual(args.source, ["openai-primary-runtime"])
         self.assertTrue(args.apply)
@@ -79,25 +101,17 @@ class ParseArgsTests(unittest.TestCase):
         self.assertTrue(args.skip_symlinks)
 
     def test_target_provider_option_is_accepted(self):
-        with mock.patch("sys.argv", ["cxfix", "all", "--target-provider", "aimai1"]):
-            args = repair.parse_args()
+        args = repair.parse_args(["fix-all", "-g", "aimai1"])
 
         self.assertEqual(args.target_provider, "aimai1")
 
-    def test_short_encrypted_cleanup_scope_is_accepted(self):
-        with mock.patch("sys.argv", ["cxfix", "e"]):
-            args = repair.parse_args()
-
-        self.assertEqual(args.scope, "e")
-
     def test_clean_encrypted_option_is_accepted(self):
-        with mock.patch("sys.argv", ["cxfix", "all", "-e"]):
-            args = repair.parse_args()
+        args = repair.parse_args(["fix-all", "-e"])
 
         self.assertTrue(args.clean_encrypted)
 
     def test_display_config_option_is_accepted(self):
-        with mock.patch("sys.argv", ["cxfix", "-d", "--json"]):
+        with mock.patch("sys.argv", ["cxfix", "-d", "-j"]):
             args = repair.parse_args()
 
         self.assertTrue(args.display_config)
@@ -114,18 +128,47 @@ class ParseArgsTests(unittest.TestCase):
             "sys.argv",
             ["cxfix", "path", "--from-cwd", "～/dev/know ", "--to-cwd", "~/dev/know"],
         ):
-            args = repair.parse_args()
+            with redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    repair.parse_args()
 
-        self.assertEqual(args.scope, "path")
+    def test_path_migrate_and_cwd_options_are_accepted(self):
+        args = repair.parse_args(
+            ["path", "migrate", "--from-cwd", "～/dev/know ", "--to-cwd", "~/dev/know"]
+        )
+
+        self.assertEqual(args.command, repair.SCOPE_PATH)
         self.assertEqual(args.from_cwd, "～/dev/know ")
         self.assertEqual(args.to_cwd, "~/dev/know")
 
     def test_path_list_cwd_option_is_accepted(self):
-        with mock.patch("sys.argv", ["cxfix", "path", "--list-cwd", "--contains-cwd", "know"]):
-            args = repair.parse_args()
+        args = repair.parse_args(["path", "list", "-c", "know"])
 
         self.assertTrue(args.list_cwd)
         self.assertEqual(args.contains_cwd, "know")
+
+    def test_long_options_are_still_accepted(self):
+        args = repair.parse_args(
+            [
+                "path",
+                "list",
+                "--list-cwd",
+                "--contains-cwd",
+                "know",
+                "--preserve-providers",
+            ]
+        )
+
+        self.assertTrue(args.list_cwd)
+        self.assertEqual(args.contains_cwd, "know")
+        self.assertFalse(args.official_only)
+
+    def test_legacy_commands_are_rejected(self):
+        for argv in (["all", "-y"], ["e"], ["p", "-n"], ["plugin-cache", "-a"]):
+            with self.subTest(argv=argv):
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        repair.parse_args(argv)
 
 
 class ProviderConfigurationTests(unittest.TestCase):
