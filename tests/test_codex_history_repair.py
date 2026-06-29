@@ -142,7 +142,7 @@ model_provider = "ignored"
 
         self.assertEqual(actual, configured)
 
-    def test_configured_sqlite_home_prefers_env(self):
+    def test_configured_sqlite_home_prefers_config_over_env(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir) / ".codex"
             configured = Path(temp_dir) / "configured"
@@ -152,6 +152,17 @@ model_provider = "ignored"
                 f'sqlite_home = "{configured}"\n',
                 encoding="utf-8",
             )
+
+            with mock.patch.dict("os.environ", {"CODEX_SQLITE_HOME": str(env_home)}, clear=True):
+                actual = repair.configured_sqlite_home(codex_home=codex_home)
+
+        self.assertEqual(actual, configured)
+
+    def test_configured_sqlite_home_uses_env_without_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            env_home = Path(temp_dir) / "env"
+            codex_home.mkdir()
 
             with mock.patch.dict("os.environ", {"CODEX_SQLITE_HOME": str(env_home)}, clear=True):
                 actual = repair.configured_sqlite_home(codex_home=codex_home)

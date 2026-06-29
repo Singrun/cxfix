@@ -63,7 +63,8 @@ python3 install.py
 source ~/.zshrc
 ```
 
-The installer adds `~/.local/bin` to `PATH` and creates the `cxfix` alias.
+The installer adds `~/.local/bin` to `PATH`, copies the `cxfix` Python package
+next to the executable, and creates the `cxfix` alias.
 
 ## Recommended zsh Configuration
 
@@ -197,10 +198,10 @@ affected rollout files and removes only the encrypted reasoning fields, while
 preserving visible messages, summaries, tool calls, and ordinary content.
 
 Codex stores SQLite-backed state under `CODEX_HOME` by default. `cxfix`
-follows the same order for the current database: `CODEX_SQLITE_HOME`, then
-top-level `sqlite_home` in `~/.codex/config.toml`, then `CODEX_HOME`. Set
-`CODEX_SQLITE_HOME` only when you intentionally want to repair a non-default
-state directory.
+follows Codex's precedence for the current database: top-level `sqlite_home` in
+`~/.codex/config.toml`, then `CODEX_SQLITE_HOME`, then `CODEX_HOME`. Set
+`sqlite_home` or `CODEX_SQLITE_HOME` only when you intentionally want to repair
+a non-default state directory.
 
 ## Backups
 

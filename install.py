@@ -8,8 +8,10 @@ from pathlib import Path
 
 
 SOURCE = Path(__file__).with_name("codex_history_repair.py")
+PACKAGE_SOURCE = Path(__file__).with_name("cxfix")
 BIN_DIR = Path.home() / ".local" / "bin"
 TARGET = BIN_DIR / "codex-history-repair"
+PACKAGE_TARGET = BIN_DIR / "cxfix"
 ZSHRC = Path.home() / ".zshrc"
 START = "# >>> codex session history repair >>>"
 END = "# <<< codex session history repair <<<"
@@ -35,12 +37,16 @@ def main() -> None:
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(SOURCE, TARGET)
     TARGET.chmod(0o755)
+    if PACKAGE_TARGET.exists() and not PACKAGE_TARGET.is_dir():
+        raise RuntimeError(f"cannot install package over non-directory: {PACKAGE_TARGET}")
+    shutil.copytree(PACKAGE_SOURCE, PACKAGE_TARGET, dirs_exist_ok=True)
 
     current = ZSHRC.read_text(encoding="utf-8") if ZSHRC.exists() else ""
     updated = update_managed_block(current)
     ZSHRC.write_text(updated, encoding="utf-8")
 
     print(f"installed={TARGET}")
+    print(f"package={PACKAGE_TARGET}")
     print(f"configured={ZSHRC}")
     print("command=cxfix")
 

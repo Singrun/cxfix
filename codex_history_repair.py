@@ -21,75 +21,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+from cxfix.core.codex_home import CodexHome, configured_sqlite_home
+from cxfix.core.config import (
+    configured_model_provider as read_configured_model_provider,
+    configured_top_level_string as read_configured_top_level_string,
+    parse_toml_string,
+)
 
-CODEX_HOME = Path.home() / ".codex"
-CODEX_CONFIG = CODEX_HOME / "config.toml"
-TOP_LEVEL_TOML_STRING = re.compile(r"^\s*{key}\s*=\s*(.+?)\s*(?:#.*)?$")
-
-
-def parse_toml_string(value: str) -> str | None:
-    text = value.strip()
-    if not text:
-        return None
-    quote = text[0]
-    if quote in {'"', "'"}:
-        end = text.find(quote, 1)
-        if end == -1:
-            return None
-        raw = text[: end + 1]
-        if quote == '"':
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                return None
-        return raw[1:-1]
-    return text.split()[0] or None
-
-
-def configured_top_level_string(key: str, config_path: Path | None = None) -> str | None:
-    path = config_path or CODEX_CONFIG
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-
-    matcher = re.compile(TOP_LEVEL_TOML_STRING.pattern.format(key=re.escape(key)))
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("["):
-            return None
-        match = matcher.match(line)
-        if match:
-            return parse_toml_string(match.group(1))
-    return None
-
-
-def configured_sqlite_home(
-    codex_home: Path = CODEX_HOME,
-    config_path: Path | None = None,
-) -> Path:
-    env_value = os.environ.get("CODEX_SQLITE_HOME")
-    if env_value:
-        return Path(env_value).expanduser()
-    configured = configured_top_level_string("sqlite_home", config_path or codex_home / "config.toml")
-    if configured:
-        return Path(configured).expanduser()
-    return codex_home
-
-
-SQLITE_HOME = configured_sqlite_home()
-STATE_DB = SQLITE_HOME / "state_5.sqlite"
-SESSIONS = CODEX_HOME / "sessions"
-SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
-BACKUP_ROOT = CODEX_HOME / "backups" / "session-history-repair"
-RUNTIME_DIR = CODEX_HOME / "session-repair-runtime"
+CODEX_HOME_CONTEXT = CodexHome.discover()
+CODEX_HOME = CODEX_HOME_CONTEXT.root
+CODEX_CONFIG = CODEX_HOME_CONTEXT.config
+SQLITE_HOME = CODEX_HOME_CONTEXT.sqlite_home
+STATE_DB = CODEX_HOME_CONTEXT.state_db
+SESSIONS = CODEX_HOME_CONTEXT.sessions
+SESSION_INDEX = CODEX_HOME_CONTEXT.session_index
+BACKUP_ROOT = CODEX_HOME_CONTEXT.backup_root
+RUNTIME_DIR = CODEX_HOME_CONTEXT.runtime_dir
 APP_CODEX = Path("/Applications/Codex.app/Contents/Resources/codex")
 ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 DEFAULT_PROVIDER = "openai"
-PLUGIN_CACHE_ROOT = CODEX_HOME / "plugins" / "cache"
-SKILLS_ROOT = CODEX_HOME / "skills"
+PLUGIN_CACHE_ROOT = CODEX_HOME_CONTEXT.plugin_cache_root
+SKILLS_ROOT = CODEX_HOME_CONTEXT.skills_root
 VISIBLE_MOUNT_ROOT_NAME = "_cache_plugin_mounts"
 ENCRYPTED_CONTENT_KEYS = {
     "encrypted_content",
@@ -236,7 +188,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def configured_model_provider(config_path: Path | None = None) -> str | None:
-    return configured_top_level_string("model_provider", config_path)
+    return read_configured_model_provider(config_path or CODEX_CONFIG)
+
+
+def configured_top_level_string(key: str, config_path: Path | None = None) -> str | None:
+    return read_configured_top_level_string(key, config_path or CODEX_CONFIG)
 
 
 def target_provider(args: argparse.Namespace) -> str:

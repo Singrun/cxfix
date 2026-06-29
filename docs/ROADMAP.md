@@ -189,6 +189,14 @@ Exit criteria:
 4. Introduce `cxfix diagnose --json` before adding more repair mutations.
 5. Convert old scopes into aliases after the new command parser is stable.
 
+## Implementation Base
+
+The project should stay on Python while the toolchain is being stabilized. See
+`docs/ENGINEERING_DECISIONS.md` for the decision record. The priority is a
+readable, auditable repair tool with strong fixtures and manifests. A Rust or Go
+rewrite can be reconsidered later if single-binary distribution or cross-platform
+packaging becomes more important than rapid repair workflow development.
+
 ## Non-Goals
 
 - Do not clone private thread content into remote services.
