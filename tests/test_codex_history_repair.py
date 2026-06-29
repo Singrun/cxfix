@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -76,6 +78,24 @@ class ParseArgsTests(unittest.TestCase):
             args = repair.parse_args()
 
         self.assertTrue(args.clean_encrypted)
+
+    def test_path_scope_and_cwd_options_are_accepted(self):
+        with mock.patch(
+            "sys.argv",
+            ["cxfix", "path", "--from-cwd", "～/dev/know ", "--to-cwd", "~/dev/know"],
+        ):
+            args = repair.parse_args()
+
+        self.assertEqual(args.scope, "path")
+        self.assertEqual(args.from_cwd, "～/dev/know ")
+        self.assertEqual(args.to_cwd, "~/dev/know")
+
+    def test_path_list_cwd_option_is_accepted(self):
+        with mock.patch("sys.argv", ["cxfix", "path", "--list-cwd", "--contains-cwd", "know"]):
+            args = repair.parse_args()
+
+        self.assertTrue(args.list_cwd)
+        self.assertEqual(args.contains_cwd, "know")
 
 
 class ProviderConfigurationTests(unittest.TestCase):
@@ -288,6 +308,170 @@ class CleanEncryptedContentTests(unittest.TestCase):
         self.assertIn('"summary":[]', rewritten)
         self.assertIn('"message":"visible"', rewritten)
         self.assertNotIn("encrypted_content", rewritten)
+
+
+class PathMigrationTests(unittest.TestCase):
+    def test_expand_cwd_text_preserves_source_trailing_space(self):
+        with mock.patch.dict("os.environ", {"HOME": "/Users/example"}, clear=True):
+            actual = repair.expand_cwd_text("～/dev/know ", strip=False)
+
+        self.assertEqual(actual, "/Users/example/dev/know ")
+
+    def test_default_target_cwd_strips_trailing_space(self):
+        with mock.patch.dict("os.environ", {"HOME": "/Users/example"}, clear=True):
+            actual = repair.default_target_cwd("～/dev/know ")
+
+        self.assertEqual(actual, "/Users/example/dev/know")
+
+    def test_rewrite_rollout_session_meta_updates_cwd_and_provider(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rollout = root / "rollout.jsonl"
+            backup = root / "backup" / "rollout.jsonl"
+            rollout.write_text(
+                (
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": "thread-1",
+                                "cwd": "/Users/example/dev/know ",
+                                "model_provider": "old",
+                            },
+                        }
+                    )
+                    + "\n"
+                    + json.dumps({"type": "event_msg", "payload": {"message": "keep"}})
+                    + "\n"
+                ),
+                encoding="utf-8",
+            )
+
+            result = repair.rewrite_rollout_session_meta(
+                rollout,
+                backup,
+                thread_id="thread-1",
+                source_cwd="/Users/example/dev/know ",
+                target_cwd="/Users/example/dev/know",
+                provider_label="aimai1",
+                apply=True,
+            )
+            lines = [json.loads(line) for line in rollout.read_text(encoding="utf-8").splitlines()]
+
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["cwd_changed"])
+        self.assertTrue(result["provider_changed"])
+        self.assertEqual(lines[0]["payload"]["cwd"], "/Users/example/dev/know")
+        self.assertEqual(lines[0]["payload"]["model_provider"], "aimai1")
+        self.assertEqual(lines[1]["payload"]["message"], "keep")
+
+    def test_migrate_thread_paths_updates_only_matching_threads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            sessions = codex_home / "sessions"
+            sessions.mkdir()
+            state_db = codex_home / "state_5.sqlite"
+            rollout = sessions / "rollout-thread-1.jsonl"
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "thread-1",
+                            "cwd": "/Users/example/dev/know ",
+                            "model_provider": "old",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(state_db)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        rollout_path TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        model_provider TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO threads (id, rollout_path, cwd, model_provider, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            "thread-1",
+                            "sessions/rollout-thread-1.jsonl",
+                            "/Users/example/dev/know ",
+                            "old",
+                            2,
+                        ),
+                        (
+                            "thread-2",
+                            "sessions/other.jsonl",
+                            "/Users/example/dev/know",
+                            "old",
+                            1,
+                        ),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with mock.patch.object(repair, "STATE_DB", state_db), mock.patch.object(
+                repair, "CODEX_HOME", codex_home
+            ):
+                result = repair.migrate_thread_paths(
+                    source_cwd="/Users/example/dev/know ",
+                    target_cwd="/Users/example/dev/know",
+                    provider_label="aimai1",
+                    backup_dir=root / "backup",
+                    apply=True,
+                )
+            connection = sqlite3.connect(state_db)
+            try:
+                rows = {
+                    row[0]: (row[1], row[2])
+                    for row in connection.execute(
+                        "SELECT id, cwd, model_provider FROM threads ORDER BY id"
+                    )
+                }
+            finally:
+                connection.close()
+
+        self.assertEqual(result["matched_threads"], 1)
+        self.assertEqual(result["database_cwd_rows_changed"], 1)
+        self.assertEqual(result["database_provider_rows_changed"], 1)
+        self.assertEqual(rows["thread-1"], ("/Users/example/dev/know", "aimai1"))
+        self.assertEqual(rows["thread-2"], ("/Users/example/dev/know", "old"))
+
+    def test_list_thread_cwds_counts_and_filters(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_db = Path(temp_dir) / "state_5.sqlite"
+            connection = sqlite3.connect(state_db)
+            try:
+                connection.execute("CREATE TABLE threads (cwd TEXT NOT NULL)")
+                connection.executemany(
+                    "INSERT INTO threads (cwd) VALUES (?)",
+                    [("/a/know",), ("/a/know",), ("/b/other ",)],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with mock.patch.object(repair, "STATE_DB", state_db):
+                rows = repair.list_thread_cwds("know")
+
+        self.assertEqual(rows, [("/a/know", 2)])
 
 
 if __name__ == "__main__":

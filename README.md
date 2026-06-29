@@ -139,6 +139,31 @@ Run encrypted cleanup together with a full history repair:
 cxfix all -y -e
 ```
 
+Preview a thread path migration without writing:
+
+```bash
+cxfix path --from-cwd '～/dev/know '
+```
+
+List known thread working directories before choosing a migration:
+
+```bash
+cxfix path --list-cwd --contains-cwd know
+```
+
+Apply the path migration and align matching threads to the current configured
+provider:
+
+```bash
+cxfix path --from-cwd '～/dev/know ' --apply -y
+```
+
+Choose the replacement path and provider explicitly:
+
+```bash
+cxfix path --from-cwd '～/dev/know ' --to-cwd '~/dev/know' --target-provider aimai1 --apply -y
+```
+
 Mount all cached plugin skills visibly into Codex:
 
 ```bash
@@ -196,6 +221,15 @@ Official OpenAI endpoints can reject those payloads with errors such as
 `Encrypted content could not be decrypted or parsed`. `cxfix e` backs up the
 affected rollout files and removes only the encrypted reasoning fields, while
 preserving visible messages, summaries, tool calls, and ordinary content.
+
+`cxfix path` repairs thread working-directory drift. It updates matching
+`threads.cwd` rows in SQLite and the corresponding rollout `session_meta.cwd`
+values, backing up both before writes. By default, `--to-cwd` is derived from
+`--from-cwd` by replacing a leading full-width `～` with `~`, expanding the home
+directory, and stripping surrounding whitespace. The source value is matched
+exactly after `~` expansion, so paths with trailing spaces must be quoted in the
+shell. Provider labels are aligned to the current configured provider unless
+`--preserve-providers` is used.
 
 Codex stores SQLite-backed state under `CODEX_HOME` by default. `cxfix`
 follows Codex's precedence for the current database: top-level `sqlite_home` in
