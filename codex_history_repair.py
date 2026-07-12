@@ -628,7 +628,14 @@ def discover_state_databases(
         candidates.append(
             Path(configured_sqlite_home_env).expanduser() / "state_5.sqlite"
         )
-    if managed_root.is_dir():
+    codexbar_installed = any(
+        path.is_dir()
+        for path in (
+            Path("/Applications/CodexBar.app"),
+            home / "Applications" / "CodexBar.app",
+        )
+    )
+    if codexbar_installed and managed_root.is_dir():
         candidates.extend(sorted(managed_root.glob("*/state_5.sqlite")))
 
     discovered: list[Path] = []
@@ -1697,7 +1704,11 @@ def run_interactive_menu() -> int:
             "  7. 检查插件技能挂载（只读）\n"
             "  0. 退出"
         )
-        choice = input("请选择 [0-7]: ").strip()
+        try:
+            choice = input("请选择 [0-7]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已退出。")
+            return 0
         if choice == "0":
             return 0
         if choice == "1":

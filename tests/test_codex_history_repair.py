@@ -34,6 +34,15 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("Codex 本地维护工具", output.getvalue())
 
+    def test_interactive_menu_handles_closed_input(self):
+        with mock.patch("builtins.input", side_effect=EOFError), redirect_stdout(
+            io.StringIO()
+        ) as output:
+            status = repair.run_interactive_menu()
+
+        self.assertEqual(status, 0)
+        self.assertIn("已退出", output.getvalue())
+
     def test_question_mark_help_lists_commands(self):
         output = io.StringIO()
         with mock.patch("sys.argv", ["cxfix", "-?"]):
@@ -335,6 +344,7 @@ class DiscoverStateDatabasesTests(unittest.TestCase):
                 / "CodexBar"
                 / "managed-codex-homes"
             )
+            (home / "Applications" / "CodexBar.app").mkdir(parents=True)
             expected = [
                 codex_home / "state_5.sqlite",
                 codex_home / "sqlite" / "state_5.sqlite",
@@ -352,6 +362,30 @@ class DiscoverStateDatabasesTests(unittest.TestCase):
                 )
 
         self.assertEqual(actual, expected)
+
+    def test_ignores_stale_codexbar_databases_after_uninstall(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            codex_home = home / ".codex"
+            current = codex_home / "state_5.sqlite"
+            stale = (
+                home
+                / "Library"
+                / "Application Support"
+                / "CodexBar"
+                / "managed-codex-homes"
+                / "old-profile"
+                / "state_5.sqlite"
+            )
+            for path in (current, stale):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+
+            actual = repair.discover_state_databases(
+                codex_home=codex_home, user_home=home
+            )
+
+        self.assertEqual(actual, [current])
 
 
 class DiscoverCachedPluginSkillsTests(unittest.TestCase):
