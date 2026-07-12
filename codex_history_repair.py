@@ -40,15 +40,16 @@ from cxfix.core.config import (
 CODEX_HOME_CONTEXT = CodexHome.discover()
 CODEX_HOME = CODEX_HOME_CONTEXT.root
 CODEX_CONFIG = CODEX_HOME_CONTEXT.config
-SQLITE_HOME = CODEX_HOME_CONTEXT.sqlite_home
-STATE_DB = CODEX_HOME_CONTEXT.state_db
+STATE_DB = Path(
+    os.environ.get("CXFIX_STATE_DB", str(CODEX_HOME_CONTEXT.state_db))
+).expanduser()
+SQLITE_HOME = STATE_DB.parent
 SESSIONS = CODEX_HOME_CONTEXT.sessions
 SESSION_INDEX = CODEX_HOME_CONTEXT.session_index
 BACKUP_ROOT = CODEX_HOME_CONTEXT.backup_root
 RUNTIME_DIR = CODEX_HOME_CONTEXT.runtime_dir
 APP_CODEX = Path("/Applications/Codex.app/Contents/Resources/codex")
 ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-DEFAULT_PROVIDER = "openai"
 PLUGIN_CACHE_ROOT = CODEX_HOME_CONTEXT.plugin_cache_root
 SKILLS_ROOT = CODEX_HOME_CONTEXT.skills_root
 VISIBLE_MOUNT_ROOT_NAME = "_cache_plugin_mounts"
@@ -132,12 +133,9 @@ Recommended commands:
   cxfix config show -j                      Display redacted machine-readable config JSON.
   cxfix provider switch PROVIDER            Switch top-level model_provider after backup.
 
-Session and provider repair:
+Session repair (historical providers are always preserved):
   cxfix fix -y                              Repair the current configured Codex database.
   cxfix fix-all -y                          Repair every discovered Codex database.
-  cxfix fix-all -y -k                       Keep historical provider labels.
-  cxfix fix-all -y -g PROVIDER
-                                             Normalize threads to an explicit provider.
   cxfix fix-all -y -r                       Mark backfill pending without launching Codex.
 
 Encrypted reasoning cleanup:
@@ -149,9 +147,8 @@ Thread cwd/path repair:
   cxfix path list -c TEXT                   Filter cwd list.
   cxfix path migrate -f '～/dev/know '      Preview exact cwd migration.
   cxfix path migrate -f '～/dev/know ' -a -y
-                                             Apply cwd migration and align provider.
-  cxfix path migrate -f OLD -o NEW -g PROVIDER -a -y
-                                             Choose replacement cwd and provider explicitly.
+                                             Apply cwd migration and preserve provider.
+  cxfix path migrate -f OLD -o NEW -a -y    Choose the replacement cwd explicitly.
 
 Plugin skill cache:
   cxfix plugins mount                       Mount cached plugin skills visibly.
@@ -199,22 +196,6 @@ Notes:
         "--yes",
         action="store_true",
         help="terminate orphaned app-servers without prompting",
-    )
-    parser.set_defaults(official_only=True)
-    parser.add_argument(
-        "-k",
-        "--preserve-providers",
-        dest="official_only",
-        action="store_false",
-        help="keep historical provider labels instead of normalizing them",
-    )
-    parser.add_argument(
-        "-g",
-        "--target-provider",
-        help=(
-            "provider label to normalize history to; defaults to the top-level "
-            "model_provider in ~/.codex/config.toml, then openai"
-        ),
     )
     parser.add_argument(
         "-e",
@@ -340,10 +321,6 @@ def configured_model_provider(config_path: Path | None = None) -> str | None:
 
 def configured_top_level_string(key: str, config_path: Path | None = None) -> str | None:
     return read_configured_top_level_string(key, config_path or CODEX_CONFIG)
-
-
-def target_provider(args: argparse.Namespace) -> str:
-    return args.target_provider or configured_model_provider() or DEFAULT_PROVIDER
 
 
 def expand_cwd_text(value: str, *, strip: bool) -> str:
@@ -683,13 +660,16 @@ def running_codex_processes() -> list[tuple[int, int, str]]:
         if len(fields) != 3:
             continue
         pid_text, ppid_text, command = fields
-        if (
-            "/Applications/Codex.app/Contents/MacOS/Codex" in command
-            or "/Applications/Codex.app/Contents/Resources/codex" in command
-            or re.search(r"\bcodex\s+app-server\b", command)
-        ):
+        if is_codex_writer_command(command):
             matches.append((int(pid_text), int(ppid_text), command))
     return matches
+
+
+def is_codex_writer_command(command: str) -> bool:
+    if "/Applications/Codex.app/Contents/MacOS/Codex" in command:
+        return True
+    executable = re.search(r"(?:^|\s)(\S*/codex|codex)(?:\s|$)", command)
+    return bool(executable and re.search(r"(?:^|\s)app-server(?:\s|$)", command))
 
 
 def terminate_orphan_servers(processes: list[tuple[int, int, str]]) -> None:
@@ -811,100 +791,6 @@ def backup_and_mark_pending() -> tuple[Path, int, int]:
     return backup_dir, before_count, missing_before
 
 
-def normalize_rollout_file(
-    path: Path, backup_path: Path, provider_label: str
-) -> str | None:
-    temp_path = path.with_name(path.name + ".cxfix.tmp")
-    changed_provider: str | None = None
-    changed = False
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with path.open("r", encoding="utf-8") as source:
-        lines = source.readlines()
-
-    updated_lines: list[str] = []
-    for line in lines:
-        item = json.loads(line)
-        if item.get("type") == "session_meta":
-            payload = item.get("payload") or {}
-            provider = payload.get("model_provider")
-            if provider != provider_label:
-                changed_provider = provider or "<missing>"
-                changed = True
-                payload["model_provider"] = provider_label
-                item["payload"] = payload
-                line = json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
-        updated_lines.append(line)
-
-    if not changed:
-        return None
-
-    shutil.copy2(path, backup_path)
-    try:
-        with temp_path.open("w", encoding="utf-8") as target:
-            target.writelines(updated_lines)
-            target.flush()
-            os.fsync(target.fileno())
-        shutil.copystat(path, temp_path)
-        os.replace(temp_path, path)
-    finally:
-        temp_path.unlink(missing_ok=True)
-    return changed_provider
-
-
-def normalize_legacy_providers(
-    backup_dir: Path, provider_label: str
-) -> dict[str, object]:
-    changed_files: list[str] = []
-    original_counts: dict[str, int] = {}
-    rollout_backup_root = backup_dir / "rollouts"
-
-    for path in sorted(SESSIONS.rglob("*.jsonl")):
-        relative = path.relative_to(SESSIONS)
-        provider = normalize_rollout_file(
-            path, rollout_backup_root / relative, provider_label
-        )
-        if provider is not None:
-            original_counts[provider] = original_counts.get(provider, 0) + 1
-            changed_files.append(str(relative))
-
-    connection = connect()
-    try:
-        before_rows = {
-            row[0]: row[1]
-            for row in connection.execute(
-                """
-                SELECT model_provider, COUNT(*)
-                FROM threads
-                WHERE model_provider <> ?
-                GROUP BY model_provider
-                """,
-                (provider_label,),
-            )
-        }
-        with connection:
-            cursor = connection.execute(
-                """
-                UPDATE threads
-                SET model_provider = ?
-                WHERE model_provider <> ?
-                """,
-                (provider_label, provider_label),
-            )
-        updated_rows = cursor.rowcount
-    finally:
-        connection.close()
-
-    return {
-        "target_provider": provider_label,
-        "rollout_files_changed": len(changed_files),
-        "rollout_original_provider_counts": original_counts,
-        "database_rows_changed": updated_rows,
-        "database_original_provider_counts": before_rows,
-        "changed_rollouts": changed_files,
-    }
-
-
 def create_backup_dir(label: str) -> Path:
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f-%z")
     backup_dir = BACKUP_ROOT / f"{stamp}-{label}"
@@ -940,7 +826,6 @@ def rewrite_rollout_session_meta(
     thread_id: str,
     source_cwd: str,
     target_cwd: str,
-    provider_label: str | None,
     apply: bool,
 ) -> dict[str, object]:
     try:
@@ -950,12 +835,10 @@ def rewrite_rollout_session_meta(
             "changed": False,
             "missing": True,
             "cwd_changed": False,
-            "provider_changed": False,
         }
 
     changed = False
     cwd_changed = False
-    provider_changed = False
     updated_lines: list[str] = []
     for line in lines:
         try:
@@ -969,10 +852,6 @@ def rewrite_rollout_session_meta(
                 if payload.get("cwd") == source_cwd:
                     payload["cwd"] = target_cwd
                     cwd_changed = True
-                    changed = True
-                if provider_label is not None and payload.get("model_provider") != provider_label:
-                    payload["model_provider"] = provider_label
-                    provider_changed = True
                     changed = True
                 item["payload"] = payload
                 if changed:
@@ -997,24 +876,80 @@ def rewrite_rollout_session_meta(
         "changed": changed,
         "missing": False,
         "cwd_changed": cwd_changed,
-        "provider_changed": provider_changed,
     }
+
+
+def replace_exact_json_path(value: object, source: str, target: str) -> tuple[object, int]:
+    if isinstance(value, str):
+        return (target, 1) if value == source else (value, 0)
+    if isinstance(value, list):
+        changed = 0
+        items = []
+        for item in value:
+            updated, count = replace_exact_json_path(item, source, target)
+            items.append(updated)
+            changed += count
+        return items, changed
+    if isinstance(value, dict):
+        changed = 0
+        items: dict[str, object] = {}
+        for key, item in value.items():
+            new_key = target if key == source else key
+            if new_key in items and new_key != key:
+                raise ValueError(f"path migration would overwrite JSON key {new_key!r}")
+            changed += int(new_key != key)
+            updated, count = replace_exact_json_path(item, source, target)
+            items[new_key] = updated
+            changed += count
+        return items, changed
+    return value, 0
+
+
+def migrate_global_state_path(
+    source_cwd: str,
+    target_cwd: str,
+    *,
+    backup_dir: Path | None,
+    apply: bool,
+) -> dict[str, object]:
+    global_state = CODEX_HOME / ".codex-global-state.json"
+    if not global_state.is_file():
+        return {"path": str(global_state), "matches": 0, "changed": False, "missing": True}
+    payload = json.loads(global_state.read_text(encoding="utf-8"))
+    updated, matches = replace_exact_json_path(payload, source_cwd, target_cwd)
+    if apply and matches:
+        if backup_dir is None:
+            raise RuntimeError("backup directory is required for global state migration")
+        shutil.copy2(global_state, backup_dir / global_state.name)
+        temp_path = global_state.with_name(global_state.name + ".cxfix.tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(updated, ensure_ascii=False, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            shutil.copystat(global_state, temp_path)
+            os.replace(temp_path, global_state)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    return {"path": str(global_state), "matches": matches, "changed": bool(apply and matches), "missing": False}
 
 
 def migrate_thread_paths(
     *,
     source_cwd: str,
     target_cwd: str,
-    provider_label: str | None,
     backup_dir: Path | None,
     apply: bool,
 ) -> dict[str, object]:
+    global_state_preview = migrate_global_state_path(
+        source_cwd, target_cwd, backup_dir=None, apply=False
+    )
     connection = connect()
     connection.row_factory = sqlite3.Row
     try:
         rows = connection.execute(
             """
-            SELECT id, rollout_path, cwd, model_provider
+            SELECT id, rollout_path, cwd
             FROM threads
             WHERE cwd = ?
             ORDER BY updated_at DESC, id DESC
@@ -1022,29 +957,18 @@ def migrate_thread_paths(
             (source_cwd,),
         ).fetchall()
         thread_ids = [row["id"] for row in rows]
-        provider_updates = [
-            row["id"]
-            for row in rows
-            if provider_label is not None and row["model_provider"] != provider_label
-        ]
         if apply and rows:
             with connection:
                 connection.executemany(
                     "UPDATE threads SET cwd = ? WHERE id = ?",
                     [(target_cwd, row["id"]) for row in rows],
                 )
-                if provider_label is not None:
-                    connection.executemany(
-                        "UPDATE threads SET model_provider = ? WHERE id = ?",
-                        [(provider_label, thread_id) for thread_id in provider_updates],
-                    )
     finally:
         connection.close()
 
     rollout_changed = 0
     rollout_missing = 0
     rollout_cwd_changed = 0
-    rollout_provider_changed = 0
     changed_rollouts: list[str] = []
     rollout_backup_root = backup_dir / "path-rollouts" if backup_dir else None
     for row in rows:
@@ -1059,7 +983,6 @@ def migrate_thread_paths(
             thread_id=row["id"],
             source_cwd=source_cwd,
             target_cwd=target_cwd,
-            provider_label=provider_label,
             apply=apply,
         )
         if result["missing"]:
@@ -1069,24 +992,25 @@ def migrate_thread_paths(
             changed_rollouts.append(str(relative))
         if result["cwd_changed"]:
             rollout_cwd_changed += 1
-        if result["provider_changed"]:
-            rollout_provider_changed += 1
+
+    global_state = global_state_preview
+    if apply and global_state_preview["matches"]:
+        global_state = migrate_global_state_path(
+            source_cwd, target_cwd, backup_dir=backup_dir, apply=True
+        )
 
     return {
         "source_cwd": source_cwd,
         "target_cwd": target_cwd,
-        "target_provider": provider_label,
         "apply": apply,
         "matched_threads": len(rows),
         "thread_ids": thread_ids,
         "database_cwd_rows_changed": len(rows) if apply else 0,
-        "database_provider_rows_changed": len(provider_updates) if apply else 0,
-        "database_provider_rows_would_change": len(provider_updates),
         "rollout_files_changed": rollout_changed,
         "rollout_files_missing": rollout_missing,
         "rollout_cwd_changed": rollout_cwd_changed,
-        "rollout_provider_changed": rollout_provider_changed,
         "changed_rollouts": changed_rollouts,
+        "global_state": global_state,
     }
 
 
@@ -1242,6 +1166,33 @@ def state_summary() -> dict[str, object]:
     return summary
 
 
+def global_state_summary() -> dict[str, object]:
+    path = CODEX_HOME / ".codex-global-state.json"
+    summary: dict[str, object] = {"path": str(path), "exists": path.is_file()}
+    if not path.is_file():
+        return summary
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        summary["error"] = str(exc)
+        return summary
+    keys = (
+        "active-workspace-roots",
+        "electron-saved-workspace-roots",
+        "electron-workspace-root-labels",
+        "project-order",
+        "pinned-project-ids",
+        "pinned-thread-ids",
+        "projectless-thread-ids",
+        "thread-workspace-root-hints",
+        "thread-writable-roots",
+    )
+    summary["workspace_state"] = {
+        key: payload[key] for key in keys if key in payload
+    }
+    return summary
+
+
 def config_summary() -> dict[str, object]:
     config = load_toml_config(CODEX_CONFIG)
     active_provider = configured_model_provider()
@@ -1265,6 +1216,7 @@ def config_summary() -> dict[str, object]:
         "desktop": redact_config(config.get("desktop", {})),
         "redacted_config": redact_config(config),
         "state": state_summary(),
+        "global_state": global_state_summary(),
     }
 
 
@@ -1300,6 +1252,13 @@ def run_display_config(args: argparse.Namespace) -> int:
     print_list("plugins", summary["plugins"])
     print_list("mcp_servers", summary["mcp_servers"])
     print_list("projects", summary["projects"], limit=30)
+    global_state = summary["global_state"]
+    print(f"global_state={global_state.get('path')} exists={global_state.get('exists')}")
+    if "workspace_state" in global_state:
+        print(
+            "workspace_state="
+            + json.dumps(global_state["workspace_state"], ensure_ascii=False)
+        )
     print("features=" + json.dumps(summary["features"], ensure_ascii=False))
     print("desktop=" + json.dumps(summary["desktop"], ensure_ascii=False))
     return 0
@@ -1341,63 +1300,6 @@ def run_provider_switch(args: argparse.Namespace) -> int:
         print(f"previous_provider={result['previous_provider'] or '<unset>'}")
         print(f"new_provider={result['new_provider']}")
     return 0
-
-
-def rollout_has_user_event(path: Path) -> bool:
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                item = json.loads(line)
-                payload = item.get("payload") or {}
-                if (
-                    item.get("type") == "event_msg"
-                    and payload.get("type") == "user_message"
-                    and str(payload.get("message") or "").strip()
-                ):
-                    return True
-    except (OSError, json.JSONDecodeError):
-        return False
-    return False
-
-
-def reconcile_user_event_flags() -> dict[str, object]:
-    connection = connect()
-    connection.row_factory = sqlite3.Row
-    changed = 0
-    true_count = 0
-    false_count = 0
-    missing_rollouts: list[str] = []
-    try:
-        rows = connection.execute(
-            "SELECT id, rollout_path, has_user_event FROM threads"
-        ).fetchall()
-        updates: list[tuple[int, str]] = []
-        for row in rows:
-            path = Path(row["rollout_path"])
-            if not path.is_absolute():
-                path = CODEX_HOME / path
-            if not path.is_file():
-                missing_rollouts.append(row["id"])
-                continue
-            desired = 1 if rollout_has_user_event(path) else 0
-            true_count += desired
-            false_count += 1 - desired
-            if row["has_user_event"] != desired:
-                updates.append((desired, row["id"]))
-        with connection:
-            connection.executemany(
-                "UPDATE threads SET has_user_event = ? WHERE id = ?",
-                updates,
-            )
-        changed = len(updates)
-    finally:
-        connection.close()
-    return {
-        "database_rows_changed": changed,
-        "has_user_event_true": true_count,
-        "has_user_event_false": false_count,
-        "missing_rollout_ids": missing_rollouts,
-    }
 
 
 def mark_backfill_complete() -> None:
@@ -1549,17 +1451,7 @@ def run_single(args: argparse.Namespace) -> int:
     print(f"state_database={STATE_DB}")
     print(f"threads_before={before_count} missing_rollouts_before={missing_before}")
 
-    normalization = None
     encrypted_cleanup = None
-    provider_label = target_provider(args)
-    if args.official_only:
-        normalization = normalize_legacy_providers(backup_dir, provider_label)
-        print(
-            f"target_provider={provider_label} "
-            "normalized_rollouts="
-            f"{normalization['rollout_files_changed']} "
-            f"normalized_database_rows={normalization['database_rows_changed']}"
-        )
 
     if args.clean_encrypted:
         encrypted_cleanup = clean_encrypted_rollouts(backup_dir)
@@ -1570,20 +1462,11 @@ def run_single(args: argparse.Namespace) -> int:
             f"{encrypted_cleanup['rollout_files_changed']}"
         )
 
-    user_event_reconciliation = reconcile_user_event_flags()
-    print(
-        "user_event_rows_changed="
-        f"{user_event_reconciliation['database_rows_changed']} "
-        f"user_threads={user_event_reconciliation['has_user_event_true']}"
-    )
-
     if args.prepare_only:
-        if normalization is not None or encrypted_cleanup is not None:
+        if encrypted_cleanup is not None:
             manifest_path = backup_dir / "manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["provider_normalization"] = normalization
             manifest["encrypted_cleanup"] = encrypted_cleanup
-            manifest["user_event_reconciliation"] = user_event_reconciliation
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
@@ -1591,7 +1474,7 @@ def run_single(args: argparse.Namespace) -> int:
         print("Prepared. Reopen Codex to run the pending backfill.")
         return 0
 
-    if missing_before == 0 and not user_event_reconciliation["missing_rollout_ids"]:
+    if missing_before == 0:
         mark_backfill_complete()
         observations = [("reconciled", before_count), ("complete", before_count)]
     else:
@@ -1607,9 +1490,7 @@ def run_single(args: argparse.Namespace) -> int:
             "observations": observations,
             "thread_count_after": after_count,
             "rollouts_missing_from_database_after": sorted(missing_after),
-            "provider_normalization": normalization,
             "encrypted_cleanup": encrypted_cleanup,
-            "user_event_reconciliation": user_event_reconciliation,
             "provider_counts_after": provider_counts(),
         }
     )
@@ -1618,13 +1499,7 @@ def run_single(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
 
-    counts_after = provider_counts()
-    legacy_remaining = (
-        sum(count for provider, count in counts_after.items() if provider != provider_label)
-        if args.official_only
-        else 0
-    )
-    if missing_after or legacy_remaining:
+    if missing_after:
         print(
             "Backfill completed, but verification found remaining discrepancies. "
             f"See {manifest_path}",
@@ -1688,15 +1563,10 @@ def run_path_migration(args: argparse.Namespace) -> int:
 
     source_cwd = expand_cwd_text(args.from_cwd, strip=False)
     target_cwd = expand_cwd_text(args.to_cwd, strip=True) if args.to_cwd else default_target_cwd(args.from_cwd)
-    if source_cwd == target_cwd and args.official_only:
-        print(
-            "source and target cwd are identical; provider alignment will still be checked."
-        )
-    elif source_cwd == target_cwd:
+    if source_cwd == target_cwd:
         print("source and target cwd are identical; nothing to migrate.", file=sys.stderr)
         return 2
 
-    provider_label = target_provider(args) if args.official_only else None
     if args.apply:
         guard_status = ensure_no_active_writers(args)
         if guard_status != 0:
@@ -1710,7 +1580,6 @@ def run_path_migration(args: argparse.Namespace) -> int:
     result = migrate_thread_paths(
         source_cwd=source_cwd,
         target_cwd=target_cwd,
-        provider_label=provider_label,
         backup_dir=backup_dir,
         apply=args.apply,
     )
@@ -1719,12 +1588,9 @@ def run_path_migration(args: argparse.Namespace) -> int:
     print(f"mode={mode}")
     print(f"source_cwd={source_cwd!r}")
     print(f"target_cwd={target_cwd!r}")
-    print(f"target_provider={provider_label or '<preserved>'}")
+    print("provider=preserved")
     print(f"matched_threads={result['matched_threads']}")
-    print(
-        "database_provider_rows_would_change="
-        f"{result['database_provider_rows_would_change']}"
-    )
+    print(f"global_state_path_matches={result['global_state']['matches']}")
     print(
         "rollout_files_changed="
         f"{result['rollout_files_changed']} "
@@ -1751,7 +1617,7 @@ def run_path_migration(args: argparse.Namespace) -> int:
     elif not args.apply:
         print("Run again with --apply to write changes.")
 
-    if result["matched_threads"] == 0:
+    if result["matched_threads"] == 0 and result["global_state"]["matches"] == 0:
         return 1
     return 0
 
@@ -1762,6 +1628,29 @@ def run_all(args: argparse.Namespace) -> int:
         print("No Codex state databases were found.", file=sys.stderr)
         return 2
 
+    inventories: dict[Path, set[str]] = {}
+    for database in databases:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            inventories[database] = {
+                row[0] for row in connection.execute("SELECT id FROM threads")
+            }
+        finally:
+            connection.close()
+    union = set().union(*inventories.values())
+    if any(ids != union for ids in inventories.values()):
+        print(
+            "State databases contain different thread sets; refusing bulk repair.",
+            file=sys.stderr,
+        )
+        for database, ids in inventories.items():
+            print(
+                f"  threads={len(ids)} missing_from_union={len(union - ids)} {database}",
+                file=sys.stderr,
+            )
+        print("Use the interactive database check before choosing a canonical database.", file=sys.stderr)
+        return 5
+
     print(f"all_targets={len(databases)}")
     failures: list[tuple[Path, int]] = []
     for index, database in enumerate(databases, start=1):
@@ -1769,21 +1658,17 @@ def run_all(args: argparse.Namespace) -> int:
         command = [
             sys.executable,
             str(Path(__file__).resolve()),
-            "current",
+            "fix",
             "--timeout",
             str(args.timeout),
             "-y",
         ]
         if args.prepare_only:
             command.append("-r")
-        if not args.official_only:
-            command.append("-k")
-        if args.target_provider:
-            command.extend(["-g", args.target_provider])
         if args.clean_encrypted:
             command.append("-e")
         env = os.environ.copy()
-        env["CODEX_SQLITE_HOME"] = str(database.parent)
+        env["CXFIX_STATE_DB"] = str(database)
         result = subprocess.run(command, env=env)
         if result.returncode != 0:
             failures.append((database, result.returncode))
@@ -1798,7 +1683,70 @@ def run_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_interactive_menu() -> int:
+    while True:
+        print(
+            "\n"
+            "cxfix - Codex 本地维护工具\n"
+            "  1. 查看配置与线程概况（只读）\n"
+            "  2. 查看线程工作路径（只读）\n"
+            "  3. 迁移线程工作路径\n"
+            "  4. 修复当前线程索引\n"
+            "  5. 检查全部状态数据库\n"
+            "  6. 清理加密推理字段\n"
+            "  7. 检查插件技能挂载（只读）\n"
+            "  0. 退出"
+        )
+        choice = input("请选择 [0-7]: ").strip()
+        if choice == "0":
+            return 0
+        if choice == "1":
+            run_display_config(parse_args(["config", "show"]))
+        elif choice == "2":
+            keyword = input("路径筛选（直接回车显示全部）: ").strip()
+            argv = ["path", "list"]
+            if keyword:
+                argv.extend(["-c", keyword])
+            run_path_migration(parse_args(argv))
+        elif choice == "3":
+            source = input("原路径（会保留末尾空格）: ")
+            target = input("新路径（直接回车自动规范化）: ").strip()
+            argv = ["path", "migrate", "-f", source]
+            if target:
+                argv.extend(["-o", target])
+            preview = parse_args(argv)
+            status = run_path_migration(preview)
+            if status not in {0, 1}:
+                continue
+            if input("确认按以上范围写入？[y/N]: ").strip().lower() in {"y", "yes"}:
+                preview.apply = True
+                preview.yes = True
+                run_path_migration(preview)
+        elif choice == "4":
+            if input("请先退出其他 Codex 窗口。继续？[y/N]: ").strip().lower() in {"y", "yes"}:
+                run_single(parse_args(["fix", "-y"]))
+        elif choice == "5":
+            databases = discover_state_databases()
+            print(f"发现 {len(databases)} 个状态数据库：")
+            for database in databases:
+                connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+                try:
+                    count = connection.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+                    print(f"  {count:5} {database}")
+                finally:
+                    connection.close()
+        elif choice == "6":
+            if input("此操作会重写 rollout（自动备份）。继续？[y/N]: ").strip().lower() in {"y", "yes"}:
+                run_single(parse_args(["clean", "-y"]))
+        elif choice == "7":
+            run_plugin_cache(parse_args(["plugins", "mount", "-n"]))
+        else:
+            print("无效选择，请重新输入。")
+
+
 def main() -> int:
+    if len(sys.argv) == 1 and sys.stdin.isatty():
+        return run_interactive_menu()
     args = parse_args()
     if args.display_config:
         return run_display_config(args)

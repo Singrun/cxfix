@@ -19,9 +19,9 @@ or synchronize every discovered database, including CodexBar managed homes.
 - Verifies the SQLite database with `PRAGMA quick_check`.
 - Backs up each database before making changes.
 - Rebuilds missing thread index rows from local rollout files.
-- Reconciles `has_user_event` flags from actual user messages.
-- Optionally normalizes historical provider labels to the active configured
-  provider, or to an explicit `--target-provider`.
+- Preserves Codex-managed visibility fields and historical provider labels.
+- Migrates exact workspace paths across SQLite, rollouts, and
+  `.codex-global-state.json`.
 - Optionally removes provider-specific encrypted reasoning payloads that can
   break when a thread switches between official OpenAI and third-party routed
   APIs.
@@ -88,8 +88,6 @@ alias cxfix-now='cxfix fix -y'
 # Synchronize every discovered Codex database.
 alias cxfix-all='cxfix fix-all -y'
 
-# Preserve third-party provider labels.
-alias cxfix-keep='cxfix fix-all -y -k'
 ```
 
 Do not run these aliases while Codex Desktop is open. The utility will refuse
@@ -142,18 +140,6 @@ Repair every discovered database:
 cxfix fix-all -y
 ```
 
-Keep existing provider labels:
-
-```bash
-cxfix fix-all -y -k
-```
-
-Normalize to a specific provider label:
-
-```bash
-cxfix fix-all -y -g aimai1
-```
-
 Prepare the database and let Codex perform backfill after reopening:
 
 ```bash
@@ -184,17 +170,16 @@ List known thread working directories before choosing a migration:
 cxfix path list -c know
 ```
 
-Apply the path migration and align matching threads to the current configured
-provider:
+Apply the path migration while preserving each thread provider:
 
 ```bash
 cxfix path migrate -f '～/dev/know ' -a -y
 ```
 
-Choose the replacement path and provider explicitly:
+Choose the replacement path explicitly:
 
 ```bash
-cxfix path migrate -f '～/dev/know ' -o '~/dev/know' -g aimai1 -a -y
+cxfix path migrate -f '～/dev/know ' -o '~/dev/know' -a -y
 ```
 
 Mount all cached plugin skills visibly into Codex:
@@ -235,12 +220,7 @@ cached `SKILL.md`, so official cache files are not modified. The short hash
 keeps generated skill names under Codex's 64-character limit while preserving
 the full source path inside the wrapper body.
 
-By default, provider labels are normalized to the top-level `model_provider` in
-`~/.codex/config.toml`, falling back to `openai` when no provider is configured.
-This helps recover threads hidden by provider filtering, but it is a deliberate
-data change. Use `-g PROVIDER` / `--target-provider PROVIDER` to choose the
-label explicitly, or `-k` / `--preserve-providers` when provider-specific
-history separation matters.
+Index and path repairs never rewrite historical thread provider labels.
 
 When a thread has used both official OpenAI APIs and third-party routed APIs,
 Codex may replay provider-specific `encrypted_content` from the older turn.
@@ -250,13 +230,13 @@ the affected rollout files and removes only the encrypted reasoning fields,
 while preserving visible messages, summaries, tool calls, and ordinary content.
 
 `cxfix path` repairs thread working-directory drift. It updates matching
-`threads.cwd` rows in SQLite and the corresponding rollout `session_meta.cwd`
-values, backing up both before writes. By default, `-o` / `--to-cwd` is derived
+`threads.cwd` rows in SQLite, rollout `session_meta.cwd` values, and exact path
+values or keys in `.codex-global-state.json`, backing them up before writes.
+By default, `-o` / `--to-cwd` is derived
 from `-f` / `--from-cwd` by replacing a leading full-width `～` with `~`,
 expanding the home directory, and stripping surrounding whitespace. The source
 value is matched exactly after `~` expansion, so paths with trailing spaces must
-be quoted in the shell. Provider labels are aligned to the current configured
-provider unless `-k` / `--preserve-providers` is used.
+be quoted in the shell.
 
 Codex stores SQLite-backed state under `CODEX_HOME` by default. `cxfix`
 follows Codex's precedence for the current database: top-level `sqlite_home` in

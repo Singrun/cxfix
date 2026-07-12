@@ -19,6 +19,21 @@ SPEC.loader.exec_module(repair)
 
 
 class ParseArgsTests(unittest.TestCase):
+    def test_detects_app_server_with_intervening_arguments(self):
+        command = (
+            "/Applications/ChatGPT.app/Contents/Resources/codex "
+            "-c features.code_mode_host=true app-server --analytics-default-enabled"
+        )
+
+        self.assertTrue(repair.is_codex_writer_command(command))
+
+    def test_interactive_menu_can_exit_without_writes(self):
+        with mock.patch("builtins.input", return_value="0"), redirect_stdout(io.StringIO()) as output:
+            status = repair.run_interactive_menu()
+
+        self.assertEqual(status, 0)
+        self.assertIn("Codex 本地维护工具", output.getvalue())
+
     def test_question_mark_help_lists_commands(self):
         output = io.StringIO()
         with mock.patch("sys.argv", ["cxfix", "-?"]):
@@ -100,10 +115,11 @@ class ParseArgsTests(unittest.TestCase):
         self.assertTrue(args.visible_mounts)
         self.assertTrue(args.skip_symlinks)
 
-    def test_target_provider_option_is_accepted(self):
-        args = repair.parse_args(["fix-all", "-g", "aimai1"])
-
-        self.assertEqual(args.target_provider, "aimai1")
+    def test_history_provider_rewrite_options_are_rejected(self):
+        for argv in (["fix-all", "-g", "aimai1"], ["fix-all", "-k"]):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    repair.parse_args(argv)
 
     def test_clean_encrypted_option_is_accepted(self):
         args = repair.parse_args(["fix-all", "-e"])
@@ -155,13 +171,11 @@ class ParseArgsTests(unittest.TestCase):
                 "--list-cwd",
                 "--contains-cwd",
                 "know",
-                "--preserve-providers",
             ]
         )
 
         self.assertTrue(args.list_cwd)
         self.assertEqual(args.contains_cwd, "know")
-        self.assertFalse(args.official_only)
 
     def test_legacy_commands_are_rejected(self):
         for argv in (["all", "-y"], ["e"], ["p", "-n"], ["plugin-cache", "-a"]):
@@ -204,11 +218,6 @@ model_provider = "ignored"
             actual = repair.configured_model_provider(config)
 
         self.assertIsNone(actual)
-
-    def test_explicit_target_provider_wins(self):
-        args = mock.Mock(target_provider="custom")
-
-        self.assertEqual(repair.target_provider(args), "custom")
 
     def test_configured_sqlite_home_defaults_to_codex_home(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -435,6 +444,35 @@ class CleanEncryptedContentTests(unittest.TestCase):
 
 
 class PathMigrationTests(unittest.TestCase):
+    def test_global_state_path_migration_replaces_exact_values_and_keys(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            codex_home.mkdir()
+            state = codex_home / ".codex-global-state.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "active-workspace-roots": ["/old/path", "/old/path/child"],
+                        "electron-workspace-root-labels": {"/old/path": "Old"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            backup_dir = Path(temp_dir) / "backup"
+            backup_dir.mkdir()
+
+            with mock.patch.object(repair, "CODEX_HOME", codex_home):
+                result = repair.migrate_global_state_path(
+                    "/old/path", "/new/path", backup_dir=backup_dir, apply=True
+                )
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            backup_exists = (backup_dir / ".codex-global-state.json").is_file()
+
+        self.assertEqual(result["matches"], 2)
+        self.assertEqual(payload["active-workspace-roots"], ["/new/path", "/old/path/child"])
+        self.assertEqual(payload["electron-workspace-root-labels"], {"/new/path": "Old"})
+        self.assertTrue(backup_exists)
+
     def test_expand_cwd_text_preserves_source_trailing_space(self):
         with mock.patch.dict("os.environ", {"HOME": "/Users/example"}, clear=True):
             actual = repair.expand_cwd_text("～/dev/know ", strip=False)
@@ -447,7 +485,7 @@ class PathMigrationTests(unittest.TestCase):
 
         self.assertEqual(actual, "/Users/example/dev/know")
 
-    def test_rewrite_rollout_session_meta_updates_cwd_and_provider(self):
+    def test_rewrite_rollout_session_meta_updates_cwd_and_preserves_provider(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             rollout = root / "rollout.jsonl"
@@ -477,16 +515,14 @@ class PathMigrationTests(unittest.TestCase):
                 thread_id="thread-1",
                 source_cwd="/Users/example/dev/know ",
                 target_cwd="/Users/example/dev/know",
-                provider_label="aimai1",
                 apply=True,
             )
             lines = [json.loads(line) for line in rollout.read_text(encoding="utf-8").splitlines()]
 
         self.assertTrue(result["changed"])
         self.assertTrue(result["cwd_changed"])
-        self.assertTrue(result["provider_changed"])
         self.assertEqual(lines[0]["payload"]["cwd"], "/Users/example/dev/know")
-        self.assertEqual(lines[0]["payload"]["model_provider"], "aimai1")
+        self.assertEqual(lines[0]["payload"]["model_provider"], "old")
         self.assertEqual(lines[1]["payload"]["message"], "keep")
 
     def test_migrate_thread_paths_updates_only_matching_threads(self):
@@ -557,7 +593,6 @@ class PathMigrationTests(unittest.TestCase):
                 result = repair.migrate_thread_paths(
                     source_cwd="/Users/example/dev/know ",
                     target_cwd="/Users/example/dev/know",
-                    provider_label="aimai1",
                     backup_dir=root / "backup",
                     apply=True,
                 )
@@ -574,8 +609,7 @@ class PathMigrationTests(unittest.TestCase):
 
         self.assertEqual(result["matched_threads"], 1)
         self.assertEqual(result["database_cwd_rows_changed"], 1)
-        self.assertEqual(result["database_provider_rows_changed"], 1)
-        self.assertEqual(rows["thread-1"], ("/Users/example/dev/know", "aimai1"))
+        self.assertEqual(rows["thread-1"], ("/Users/example/dev/know", "old"))
         self.assertEqual(rows["thread-2"], ("/Users/example/dev/know", "old"))
 
     def test_list_thread_cwds_counts_and_filters(self):

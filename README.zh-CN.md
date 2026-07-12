@@ -1,6 +1,6 @@
 # cxfix
 
-`cxfix` 是一套本地 Codex 配置与线程修复工具。它面向 macOS 上的 Codex Desktop / Codex CLI，主要用于修复线程列表、工作目录、provider、插件技能缓存以及 provider 切换后可能出现的加密推理内容问题。
+`cxfix` 是一套本地 Codex 配置与线程修复工具。它面向 macOS 上的 Codex Desktop / Codex CLI，主要用于检查线程索引、迁移工作目录、核对全局状态和维护插件技能缓存。
 
 这是一个独立社区工具，不隶属于 OpenAI，也不由 OpenAI 官方支持。Codex 的本地数据库结构不是公开稳定接口，使用前请关闭 Codex，并保留工具生成的备份。
 
@@ -10,11 +10,10 @@
 - 对 SQLite 数据库执行 `PRAGMA quick_check`。
 - 修改前自动备份数据库、配置文件或 rollout 文件。
 - 从本地 rollout 文件重建缺失的线程索引。
-- 修复 `has_user_event` 标记。
-- 将历史线程 provider 统一到当前配置的 provider，或统一到指定 provider。
+- 检查多个状态数据库是否出现线程集合分叉，并在分叉时拒绝批量写入。
 - 清理 provider 切换后可能导致官方 OpenAI 接口报错的加密推理字段。
-- 展示当前 Codex 配置、provider、profile、插件、MCP server、项目路径和线程 provider 分布。
-- 修复错误工作目录，例如把 `～/dev/know ` 迁移为 `~/dev/know` 展开后的真实路径。
+- 展示当前 Codex 配置及 `.codex-global-state.json` 中的工作区状态。
+- 同步迁移 SQLite、rollout 和 `.codex-global-state.json` 中的精确工作区路径。
 - 将缓存中的 Codex 插件技能挂载到 `~/.codex/skills`。
 
 工具不会上传对话内容，也不会把 rollout 内容复制到 GitHub 或任何远程服务。
@@ -60,6 +59,12 @@ alias cxfix="noglob codex-history-repair"
 
 ## 命令总览
 
+直接启动中文菜单：
+
+```bash
+cxfix
+```
+
 查看所有命令：
 
 ```bash
@@ -94,18 +99,6 @@ cxfix fix -y
 
 ```bash
 cxfix fix-all -y
-```
-
-保留历史 provider 标签：
-
-```bash
-cxfix fix-all -y -k
-```
-
-统一到指定 provider：
-
-```bash
-cxfix fix-all -y -g aimai1
 ```
 
 只准备回填，不启动 Codex 官方回填流程：
@@ -144,16 +137,16 @@ cxfix path list -c know
 cxfix path migrate -f '～/dev/know '
 ```
 
-应用路径迁移，并把匹配线程同步到当前 provider：
+应用路径迁移（provider 保持不变）：
 
 ```bash
 cxfix path migrate -f '～/dev/know ' -a -y
 ```
 
-指定迁移目标路径和 provider：
+指定迁移目标路径：
 
 ```bash
-cxfix path migrate -f '～/dev/know ' -o '~/dev/know' -g aimai1 -a -y
+cxfix path migrate -f '～/dev/know ' -o '~/dev/know' -a -y
 ```
 
 挂载缓存中的插件技能：
@@ -189,8 +182,6 @@ cxfix plugins cache -s openai-primary-runtime -a
 | `-t` | `--timeout` | 等待官方回填的最长秒数 |
 | `-r` | `--prepare-only` | 只准备数据库，不启动回填 |
 | `-y` | `--yes` | 自动确认关闭残留 app-server |
-| `-k` | `--preserve-providers` | 保留历史 provider 标签 |
-| `-g` | `--target-provider` | 指定目标 provider |
 | `-e` | `--clean-encrypted` | 同时清理加密推理字段 |
 | `-d` | `--display-config` | 显示配置概览 |
 | `-p` | `--provider` | 切换顶层 provider |
@@ -207,21 +198,9 @@ cxfix plugins cache -s openai-primary-runtime -a
 | `-m` | `--visible-mounts` | 创建可见挂载包装 |
 | `-x` | `--skip-symlinks` | 只创建可见挂载，不创建顶层软链接 |
 
-## Provider 修复
+## Provider
 
-默认情况下，`cxfix` 会把线程 provider 统一到 `~/.codex/config.toml` 顶层的 `model_provider`。如果没有配置，则回退到 `openai`。
-
-如果希望明确指定 provider：
-
-```bash
-cxfix fix-all -y -g aimai1
-```
-
-如果希望保留历史 provider：
-
-```bash
-cxfix fix-all -y -k
-```
+线程修复和路径迁移始终保留每个线程原有的 provider，不做统一或重写。
 
 切换 provider 会先备份 `config.toml`，再修改顶层 `model_provider`：
 
@@ -231,7 +210,7 @@ cxfix provider switch aimai1
 
 ## 路径迁移
 
-`cxfix path` 用于修复线程工作目录漂移。它会更新 SQLite 中的 `threads.cwd`，也会同步更新 rollout 里的 `session_meta.cwd`。写入前会备份数据库和受影响的 rollout 文件。
+`cxfix path` 用于修复线程工作目录漂移。它会更新 SQLite 中的 `threads.cwd`、rollout 里的 `session_meta.cwd`，以及 `.codex-global-state.json` 中精确匹配的工作区路径和值。写入前会备份数据库、全局状态和受影响的 rollout 文件。
 
 典型场景是误写了全角波浪号或尾部空格：
 

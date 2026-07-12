@@ -3,7 +3,7 @@
 `cxfix` should become a safe local toolchain for diagnosing and repairing Codex
 state. Its job is not to replace the official Codex CLI. Its job is to add a
 reversible repair layer around local files, SQLite state, rollout history,
-provider metadata, plugin cache exposure, and configuration drift.
+workspace metadata, plugin cache exposure, and configuration drift.
 
 ## Product Boundary
 
@@ -11,10 +11,9 @@ provider metadata, plugin cache exposure, and configuration drift.
 repeatable verification:
 
 - Diagnose Codex home layout, active config, SQLite state, sessions, archived
-  sessions, plugins, MCP definitions, and provider consistency.
+  sessions, plugins, MCP definitions, and provider inventory.
 - Repair thread inventory mismatches between rollout files and `state_5.sqlite`.
-- Repair provider labels and provider-specific rollout fields when switching
-  between official and routed providers.
+- Preserve historical provider labels during every thread and path repair.
 - Repair plugin skill visibility without modifying plugin cache sources.
 - Prepare safe manifests that explain what changed and how to roll back.
 
@@ -63,7 +62,7 @@ cxfix/
   repairs/
     encrypted_content.py
     plugins.py
-    providers.py
+    global_state.py
     threads.py
   reports/
     manifest.py
@@ -85,8 +84,8 @@ Suggested module responsibilities:
 - `core.process_guard`: active writer detection and app-server cleanup.
 - `repairs.threads`: backfill state, rollout/database parity, visibility fields,
   archive flags, and recency fields.
-- `repairs.providers`: provider normalization, profile/provider consistency, and
-  provider reachability evidence.
+- `repairs.global_state`: exact workspace-path migration in structured desktop
+  state without broad text replacement.
 - `repairs.encrypted_content`: provider-specific reasoning payload cleanup.
 - `repairs.plugins`: cached plugin skill discovery and visible mount management.
 - `reports.manifest`: stable JSON manifests for backup, action, verification, and
@@ -94,32 +93,25 @@ Suggested module responsibilities:
 
 ## Command Shape
 
-Keep existing commands as compatibility aliases, but introduce explicit
-subcommands:
+Use the Chinese interactive menu as the default entry point while retaining
+explicit subcommands for scripts:
 
 ```text
 cxfix diagnose [--json] [--all-homes]
 cxfix repair threads [--all-homes] [--prepare-only]
-cxfix repair providers [--target-provider NAME|--preserve-providers]
+cxfix provider switch NAME
 cxfix repair encrypted [--all-homes]
 cxfix repair plugins [--apply|--dry-run] [--visible-mounts]
 cxfix doctor [--json]
 cxfix plan [--json]
 ```
 
-Compatibility mapping:
-
-- `cxfix current` -> `cxfix repair threads`
-- `cxfix all` -> `cxfix repair threads --all-homes`
-- `cxfix e` -> `cxfix repair encrypted`
-- `cxfix p` / `cxfix plugins` -> `cxfix repair plugins --visible-mounts`
-
 ## Milestones
 
 ### Milestone 1: Stabilize Current Script
 
-- Preserve the current CLI behavior.
-- Keep the provider target and encrypted-content repairs.
+- Preserve historical provider metadata.
+- Keep encrypted-content repair explicit and separately backed up.
 - Add `docs/ROADMAP.md`.
 - Keep unit tests and compile checks green.
 - Commit the current working tree to remove ambiguous dirty state.
